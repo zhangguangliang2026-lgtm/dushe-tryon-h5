@@ -352,12 +352,28 @@
         ctx2.save();
         ctx2.translate(bead.x, bead.y);
         ctx2.rotate(bead.angle);
-        if (bead.key === "tiger-eye") {
+        if (image && bead.key === "tiger-eye") {
           const k = Math.sin((bead.index + 1) * 12.9898) * 43758.5453;
-          ctx2.rotate((k - Math.floor(k) - 0.5) * 2.2);
-          if (bead.index % 2) ctx2.scale(-1, 1);
-        }
-        if (image) {
+          const f = k - Math.floor(k);
+          const k2 = Math.sin((bead.index + 1) * 78.233) * 12345.678;
+          const f2 = k2 - Math.floor(k2);
+          ctx2.save();
+          ctx2.beginPath();
+          ctx2.arc(0, 0, r * 0.97, 0, Math.PI * 2);
+          ctx2.clip();
+          ctx2.rotate((f - 0.5) * 0.7);
+          const big = r * 2.5;
+          ctx2.drawImage(image, -big / 2 + (f2 - 0.5) * r * 0.5, -big / 2 + (f - 0.5) * r * 0.4, big, big);
+          ctx2.restore();
+          const g = ctx2.createRadialGradient(-r * 0.3, -r * 0.3, r * 0.2, 0, 0, r);
+          g.addColorStop(0, "rgba(0,0,0,0)");
+          g.addColorStop(0.75, "rgba(0,0,0,0.05)");
+          g.addColorStop(1, "rgba(0,0,0,0.45)");
+          ctx2.fillStyle = g;
+          ctx2.beginPath();
+          ctx2.arc(0, 0, r * 0.98, 0, Math.PI * 2);
+          ctx2.fill();
+        } else if (image) {
           ctx2.drawImage(image, -r, -r, r * 2, r * 2);
         } else {
           ctx2.fillStyle = "#c9c2ba";
@@ -753,6 +769,125 @@
     }
   });
 
+  // src/forearm.js
+  var require_forearm = __commonJS({
+    "src/forearm.js"(exports, module) {
+      function chroma(bytes, i) {
+        const r = bytes[i];
+        const g = bytes[i + 1];
+        const b = bytes[i + 2];
+        const s = r + g + b + 1;
+        return [r / s, g / s, s / 3];
+      }
+      function skinModel2(bytes, w, h, pts) {
+        const mid = (a, b, t) => ({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+        const P = (i) => pts[i];
+        const samples = [mid(P(0), P(9), 0.3), mid(P(0), P(9), 0.55), mid(P(0), P(5), 0.5), mid(P(0), P(17), 0.5), mid(P(5), P(17), 0.5), mid(P(0), P(13), 0.4)];
+        const vals = [];
+        for (const p of samples) {
+          for (let dy = -2; dy <= 2; dy += 2) {
+            for (let dx = -2; dx <= 2; dx += 2) {
+              const x = Math.round(p.x + dx);
+              const y = Math.round(p.y + dy);
+              if (x >= 0 && y >= 0 && x < w && y < h) vals.push(chroma(bytes, (y * w + x) * 4));
+            }
+          }
+        }
+        if (vals.length < 20) return null;
+        const mean = [0, 1, 2].map((k) => vals.reduce((s, v) => s + v[k], 0) / vals.length);
+        const sd = [0, 1].map((k) => Math.sqrt(vals.reduce((s, v) => s + (v[k] - mean[k]) ** 2, 0) / vals.length));
+        return { mean, tr: Math.max(0.014, sd[0] * 2.5), tg: Math.max(0.012, sd[1] * 2.5) };
+      }
+      function isSkin2(bytes, i, m) {
+        const c = chroma(bytes, i);
+        const dr = (c[0] - m.mean[0]) / m.tr;
+        const dg = (c[1] - m.mean[1]) / m.tg;
+        const bright = c[2] / (m.mean[2] + 1);
+        return dr * dr + dg * dg < 1 && bright > 0.5 && bright < 1.7;
+      }
+      function skinRun(bytes, w, h, m, c0, n, maxLen) {
+        const at = (t) => {
+          const x = Math.round(c0.x + n.x * t);
+          const y = Math.round(c0.y + n.y * t);
+          if (x < 0 || y < 0 || x >= w || y >= h) return -1;
+          return isSkin2(bytes, (y * w + x) * 4, m) ? 1 : 0;
+        };
+        let start = null;
+        for (let k = 0; k <= maxLen * 0.4; k++) {
+          if (at(k) === 1) {
+            start = k;
+            break;
+          }
+          if (at(-k) === 1) {
+            start = -k;
+            break;
+          }
+        }
+        if (start == null) return null;
+        const go = (dir) => {
+          let t = start;
+          let miss = 0;
+          let last = start;
+          while (Math.abs(t - start) < maxLen) {
+            t += dir;
+            const v = at(t);
+            if (v === -1) return null;
+            if (v === 1) {
+              last = t;
+              miss = 0;
+            } else if (++miss > 2) return last;
+          }
+          return null;
+        };
+        const a = go(1);
+        const b = go(-1);
+        if (a == null || b == null) return null;
+        return { lo: b, hi: a };
+      }
+      function measureForearm2(bytes, w, h, pts, palmAxis) {
+        const m = skinModel2(bytes, w, h, pts);
+        if (!m) return null;
+        const p0 = pts[0];
+        const L = Math.hypot(pts[9].x - p0.x, pts[9].y - p0.y);
+        if (!(L > 6)) return null;
+        const ax = palmAxis;
+        const n = { x: -ax.y, y: ax.x };
+        const mids = [];
+        for (let a = 0.3; a <= 1.4; a += 0.1) {
+          const c0 = { x: p0.x - ax.x * a * L, y: p0.y - ax.y * a * L };
+          const r = skinRun(bytes, w, h, m, c0, n, 1.6 * L);
+          if (!r) continue;
+          const mid = (r.lo + r.hi) / 2;
+          mids.push({ x: c0.x + n.x * mid, y: c0.y + n.y * mid, w: r.hi - r.lo, a });
+        }
+        if (mids.length < 4) return null;
+        const mx = mids.reduce((s, p) => s + p.x, 0) / mids.length;
+        const my = mids.reduce((s, p) => s + p.y, 0) / mids.length;
+        let cxx = 0;
+        let cyy = 0;
+        let cxy = 0;
+        for (const p of mids) {
+          cxx += (p.x - mx) ** 2;
+          cyy += (p.y - my) ** 2;
+          cxy += (p.x - mx) * (p.y - my);
+        }
+        const ang = 0.5 * Math.atan2(2 * cxy, cxx - cyy);
+        let v = { x: Math.cos(ang), y: Math.sin(ang) };
+        if (v.x * ax.x + v.y * ax.y < 0) v = { x: -v.x, y: -v.y };
+        const agree = v.x * ax.x + v.y * ax.y;
+        const nv = { x: -v.y, y: v.x };
+        const resid = Math.sqrt(mids.reduce((s, p) => s + ((p.x - mx) * nv.x + (p.y - my) * nv.y) ** 2, 0) / mids.length);
+        const near = mids.filter((p) => p.a <= 0.8);
+        const widths = (near.length >= 2 ? near : mids).map((p) => p.w * agree).sort((x, y) => x - y);
+        const width = widths[widths.length >> 1];
+        if (agree < 0.7 || resid > 0.12 * L || width < 0.5 * L || width > 2.4 * L) return null;
+        const t = (p0.x - mx) * v.x + (p0.y - my) * v.y;
+        return { axis: v, center: { x: mx + v.x * t, y: my + v.y * t }, width, slices: mids.length, agree };
+      }
+      module.exports = { measureForearm: measureForearm2, skinModel: skinModel2, isSkin: isSkin2 };
+    }
+  });
+
   // src/main.js
   var core = require_tryon_core();
   var render = require_tryon_render();
@@ -762,11 +897,10 @@
   var HOLD_MS = 700;
   var TRACK_MS = 3e3;
   var FADE_MS = 400;
-  var PITCH_MAX = 0.3;
-  var PITCH_DEAD = 0.06;
+  var FOREARM_TILT = 0.3;
   var { grabPatch, matchPatch } = require_skin_track();
+  var { measureForearm, skinModel, isSkin } = require_forearm();
   var FOLLOW = 0.4;
-  var PITCH_GAIN = 0.5;
   var $ = (id) => document.getElementById(id);
   var state = {
     sample: 0,
@@ -1043,7 +1177,7 @@
     if (tried.indexOf(engineName) >= 0) return false;
     tried.push(WANT);
     log("\u6362\u65B9\u6848" + engineName + "\uFF1A" + reason);
-    const q = new URLSearchParams({ engine: engineName, auto: "1", tried: tried.join(","), why: "\u65B9\u6848" + WANT + " " + reason, v: "10" });
+    const q = new URLSearchParams({ engine: engineName, auto: "1", tried: tried.join(","), why: "\u65B9\u6848" + WANT + " " + reason, v: "11" });
     setTimeout(() => location.replace(location.pathname + "?" + q.toString()), 800);
     return true;
   }
@@ -1080,9 +1214,36 @@
     const r = knuckles / palm;
     return r > 0.15 && r < 1.6;
   }
+  function palmLooksLikeSkin(lm) {
+    const f = trackFrame();
+    const m = skinModel(f.bytes, f.w, f.h, lm.map((p) => ({ x: p.x * f.w, y: p.y * f.h })));
+    const ok = !!m && m.tr < 0.2 && m.tg < 0.13;
+    if (ok) state.skinM = { mean: m.mean, tr: m.tr * 1.8, tg: m.tg * 1.8 };
+    return ok;
+  }
+  function updateForearm(pts, now) {
+    const f = trackFrame();
+    const small = pts.map((p) => ({ x: p.x * f.w, y: p.y * f.h }));
+    const L = Math.hypot(small[9].x - small[0].x, small[9].y - small[0].y);
+    if (!(L > 0)) return;
+    const palmAxis = { x: (small[9].x - small[0].x) / L, y: (small[9].y - small[0].y) / L };
+    const r = measureForearm(f.bytes, f.w, f.h, small, palmAxis);
+    if (!r) return;
+    const v = { axis: r.axis, dx: r.center.x / f.w - pts[0].x, dy: r.center.y / f.h - pts[0].y, width: r.width / f.w, at: now };
+    const o = state.forearm;
+    if (o && now - o.at < 500) {
+      const k = 0.35;
+      let ax = o.axis.x * (1 - k) + v.axis.x * k;
+      let ay = o.axis.y * (1 - k) + v.axis.y * k;
+      const l = Math.hypot(ax, ay) || 1;
+      state.forearm = { axis: { x: ax / l, y: ay / l }, dx: o.dx * (1 - k) + v.dx * k, dy: o.dy * (1 - k) + v.dy * k, width: o.width * (1 - k) + v.width * k, at: now };
+    } else state.forearm = v;
+  }
   var trackCanvas = document.createElement("canvas");
   var trackCtx = trackCanvas.getContext("2d", { willReadFrequently: true });
+  var trackCache = null;
   function trackFrame() {
+    if (trackCache && trackCache.time === video.currentTime) return trackCache;
     const vw = video.videoWidth;
     const vh = video.videoHeight;
     const s = 240 / Math.max(vw, vh);
@@ -1093,7 +1254,8 @@
       trackCanvas.height = h;
     }
     trackCtx.drawImage(video, 0, 0, w, h);
-    return { bytes: trackCtx.getImageData(0, 0, w, h).data, w, h };
+    trackCache = { bytes: trackCtx.getImageData(0, 0, w, h).data, w, h, time: video.currentTime };
+    return trackCache;
   }
   function followSkin(now) {
     if (!state.trackPoint) return false;
@@ -1123,6 +1285,22 @@
     state.last = state.last.map(move);
     if (state.shown) state.shown = state.shown.map(move);
     state.trackPoint = move(state.trackPoint);
+    if (state.skinM) {
+      let bad = 0;
+      let seen = 0;
+      for (const [ox, oy] of [[0, 0], [6, 0], [-6, 0], [0, 6], [0, -6]]) {
+        const px = Math.round(state.trackPoint.x * f.w + ox);
+        const py = Math.round(state.trackPoint.y * f.h + oy);
+        if (px < 0 || py < 0 || px >= f.w || py >= f.h) continue;
+        seen++;
+        if (!isSkin(f.bytes, (py * f.w + px) * 4, state.skinM)) bad++;
+      }
+      if (seen >= 3 && bad >= Math.min(4, seen)) {
+        state.patch = null;
+        state.trackPoint = null;
+        return false;
+      }
+    }
     state.patch = grabPatch(f.bytes, f.w, f.h, state.trackPoint.x * f.w, state.trackPoint.y * f.h);
     state.skinOkAt = now;
     return !!state.patch;
@@ -1140,8 +1318,8 @@
     }
     const hd0 = res.multiHandedness && res.multiHandedness[0];
     if (!state.last || state.trackingSkin) {
-      const score = hd0 && hd0.score != null ? hd0.score : 1;
-      if (score < 0.75 || !plausibleHand(lm)) {
+      const pl = plausibleHand(lm);
+      if (!pl || !palmLooksLikeSkin(lm)) {
         state.acq = 0;
         return;
       }
@@ -1166,16 +1344,14 @@
         if (state.roll > Math.PI) state.roll -= 2 * Math.PI;
         if (state.roll < -Math.PI) state.roll += 2 * Math.PI;
       }
-      let pt = h.pitch * PITCH_GAIN;
-      pt = Math.abs(pt) < PITCH_DEAD ? 0 : pt - Math.sign(pt) * PITCH_DEAD;
-      pt = Math.max(-PITCH_MAX, Math.min(PITCH_MAX, pt));
-      state.pitch = state.pitch * 0.7 + pt * 0.3;
+      state.pitch = FOREARM_TILT;
       state.cosPitch = Math.sqrt(1 - Math.min(0.8, Math.abs(h.pitch)) ** 2);
       state.spinDir = h.spinDir;
       state.dbg = { pitchRaw: +h.pitch.toFixed(2), roll: Math.round(h.roll * 180 / Math.PI), hand: hand.label };
     }
     state.last = pts;
     state.lastSeen = now;
+    updateForearm(lm, now);
   }
   var video = $("video");
   var canvas = $("stage");
@@ -1202,7 +1378,9 @@
     const P = state.shown;
     const kn = Math.hypot((P[5].x - P[17].x) * W, (P[5].y - P[17].y) * H);
     const palm = pose.palmPx / Math.max(0.6, state.cosPitch || 1);
-    const wristPx = Math.max(KNUCKLE_TO_WRIST * kn, PALM_TO_WRIST * palm);
+    let wristPx = Math.max(KNUCKLE_TO_WRIST * kn, PALM_TO_WRIST * palm);
+    const fa = state.forearm;
+    if (fa && performance.now() - fa.at < 600) wristPx = Math.max(0.6 * wristPx, Math.min(1.3 * wristPx, fa.width * W));
     const target = wristPx / (2 * core.BODY.wristSemiBreadth(pose.wristMm));
     state.scale = state.scale ? state.scale * 0.7 + target * 0.3 : target;
     return state.scale;
@@ -1223,6 +1401,23 @@
       let pose = core.estimateWristPose(state.shown, W, H, state.wristCm * 10);
       if (pose) {
         pose = Object.assign({}, pose, { pxPerMm: wristScale(pose, W, H) });
+        const fa = state.forearm;
+        let tAxis = pose.axis;
+        let tWrist = pose.wrist;
+        if (fa && now - fa.at < 600) {
+          tAxis = fa.axis;
+          tWrist = { x: (state.shown[0].x + fa.dx) * W, y: (state.shown[0].y + fa.dy) * H };
+        }
+        const sm = state.poseSm;
+        if (sm) {
+          let ax = sm.axis.x * 0.75 + tAxis.x * 0.25;
+          let ay = sm.axis.y * 0.75 + tAxis.y * 0.25;
+          const l = Math.hypot(ax, ay) || 1;
+          state.poseSm = { axis: { x: ax / l, y: ay / l }, wrist: { x: sm.wrist.x * 0.6 + tWrist.x * 0.4, y: sm.wrist.y * 0.6 + tWrist.y * 0.4 } };
+        } else state.poseSm = { axis: tAxis, wrist: tWrist };
+        pose.axis = state.poseSm.axis;
+        pose.normal = { x: -pose.axis.y, y: pose.axis.x };
+        pose.wrist = state.poseSm.wrist;
         const list = beads();
         let rotate = 0;
         if (state.roll != null && state.spinDir) {
@@ -1231,9 +1426,13 @@
           rotate = sign * (state.roll - Math.PI) / (2 * Math.PI);
         }
         const layout = core.computeLayout({ pose, beads: list, pitch3d: state.pitch, adjust: { rotate } });
+        layout.beads.forEach((b) => {
+          if (b.back) b.hidden = true;
+        });
         ctx.globalAlpha = age < HOLD_MS ? 1 : Math.max(0, 1 - (age - HOLD_MS) / FADE_MS);
         render.drawTryon(ctx, layout, state.images, { width: W, height: H, shadow: true });
         state.drawn = now;
+        state.dbgBand = { cx: layout.band.cx, cy: layout.band.cy, ang: Math.atan2(layout.band.ny, layout.band.nx), w: layout.band.halfWidth, t: now };
         state.dbgPose = { palmPx: Math.round(pose.palmPx), pxPerMm: +pose.pxPerMm.toFixed(2), halfW: Math.round(layout.band.halfWidth), pitch: +state.pitch.toFixed(2), poseRoll: Math.round(pose.roll * 180 / Math.PI) };
         if (now - state.lastSeen < 150) state.trackPoint = { x: layout.band.cx / W, y: layout.band.cy / H };
         ctx.globalAlpha = 1;
@@ -1243,6 +1442,8 @@
       state.shown = null;
       state.roll = null;
       state.scale = 0;
+      state.poseSm = null;
+      state.forearm = null;
       state.patch = null;
       state.trackPoint = null;
       state.trackingSkin = false;
@@ -1467,7 +1668,7 @@
     updateLabels();
   };
   $("modelBtn").onclick = () => {
-    const q = new URLSearchParams({ engine: state.engineName === "A" ? "B" : "A", auto: "1", v: "10" });
+    const q = new URLSearchParams({ engine: state.engineName === "A" ? "B" : "A", auto: "1", v: "11" });
     location.replace(location.pathname + "?" + q.toString());
   };
   $("wristMinus").onclick = () => {

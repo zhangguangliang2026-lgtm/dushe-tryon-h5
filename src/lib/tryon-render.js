@@ -38,13 +38,30 @@ function drawBead(ctx, image, bead, darken, tint) {
   ctx.save();
   ctx.translate(bead.x, bead.y);
   ctx.rotate(bead.angle);
-  // 虎眼石每颗纹路方向都不一样：按珠子序号固定转一个角度，整串不会像复制出来的条纹
-  if (bead.key === 'tiger-eye') {
+  if (image && bead.key === 'tiger-eye') {
+    // 虎眼石每颗纹路都不一样：按序号把纹路图稍微转一点、挪一点（圆形裁切，边缘不变），整串不会像复制出来的
     const k = Math.sin((bead.index + 1) * 12.9898) * 43758.5453;
-    ctx.rotate((k - Math.floor(k) - 0.5) * 2.2);
-    if (bead.index % 2) ctx.scale(-1, 1);
-  }
-  if (image) {
+    const f = k - Math.floor(k);
+    const k2 = Math.sin((bead.index + 1) * 78.233) * 12345.678;
+    const f2 = k2 - Math.floor(k2);
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(0, 0, r * 0.97, 0, Math.PI * 2);
+    ctx.clip();
+    ctx.rotate((f - 0.5) * 0.7);
+    const big = r * 2.5;
+    ctx.drawImage(image, -big / 2 + (f2 - 0.5) * r * 0.5, -big / 2 + (f - 0.5) * r * 0.4, big, big);
+    ctx.restore();
+    // 裁切后边缘的立体感没了，补一圈暗边
+    const g = ctx.createRadialGradient(-r * 0.3, -r * 0.3, r * 0.2, 0, 0, r);
+    g.addColorStop(0, 'rgba(0,0,0,0)');
+    g.addColorStop(0.75, 'rgba(0,0,0,0.05)');
+    g.addColorStop(1, 'rgba(0,0,0,0.45)');
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(0, 0, r * 0.98, 0, Math.PI * 2);
+    ctx.fill();
+  } else if (image) {
     ctx.drawImage(image, -r, -r, r * 2, r * 2);
   } else {
     ctx.fillStyle = '#c9c2ba';

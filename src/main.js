@@ -14,7 +14,9 @@ const TRACK_MS = 3000; // 手认不出、但能跟住手腕皮肤时最多保持
 const FADE_MS = 400;
 const PITCH_MAX = 0.3; // 俯仰最多按 ±0.3 算：真机上估得偏大，弧线会弯成“笑脸”
 const PITCH_DEAD = 0.06; // 很小的俯仰当作 0，手链不会来回晃
+const FOREARM_TILT = 0.3;
 const { grabPatch, matchPatch } = require('./lib/skin-track');
+const { measureForearm, skinModel, isSkin } = require('./forearm');
 const FOLLOW = 0.4; // 显示位置每帧靠近识别位置的比例
 const PITCH_GAIN = 0.5; // 手腕弯曲时手掌方向不等于前臂方向，只用一半的俯仰
 
@@ -316,7 +318,7 @@ function reloadWith(engineName, reason) {
   if (tried.indexOf(engineName) >= 0) return false;
   tried.push(WANT);
   log('换方案' + engineName + '：' + reason);
-  const q = new URLSearchParams({ engine: engineName, auto: '1', tried: tried.join(','), why: '方案' + WANT + ' ' + reason, v: '10' });
+  const q = new URLSearchParams({ engine: engineName, auto: '1', tried: tried.join(','), why: '方案' + WANT + ' ' + reason, v: '11' });
   setTimeout(() => location.replace(location.pathname + '?' + q.toString()), 800);
   return true;
 }
@@ -360,10 +362,44 @@ function plausibleHand(lm) {
   return r > 0.15 && r < 1.6;
 }
 
+// 手掌中间那几块颜色要一致（是皮肤）：认到键盘、海报上时颜色很杂，直接不认
+function palmLooksLikeSkin(lm) {
+  const f = trackFrame();
+  const m = skinModel(f.bytes, f.w, f.h, lm.map((p) => ({ x: p.x * f.w, y: p.y * f.h })));
+  const ok = !!m && m.tr < 0.2 && m.tg < 0.13; // 真机手掌 90% 在 0.11 / 0.055 以下，认到键盘时是 0.30 / 0.19
+  // 跟皮肤时用的颜色范围放宽一些：手腕那块常比手掌暗、偏色
+  if (ok) state.skinM = { mean: m.mean, tr: m.tr * 1.8, tg: m.tg * 1.8 };
+  return ok;
+}
+
+// 每次认出手时量一次前臂（方向、中线、宽度），量不出就沿用最近 0.5 秒内的结果
+function updateForearm(pts, now) {
+  const f = trackFrame();
+  const small = pts.map((p) => ({ x: p.x * f.w, y: p.y * f.h }));
+  const L = Math.hypot(small[9].x - small[0].x, small[9].y - small[0].y);
+  if (!(L > 0)) return;
+  const palmAxis = { x: (small[9].x - small[0].x) / L, y: (small[9].y - small[0].y) / L };
+  const r = measureForearm(f.bytes, f.w, f.h, small, palmAxis);
+  if (!r) return;
+  // 存成相对手腕点的量（0–1 坐标），画的时候再换算
+  const v = { axis: r.axis, dx: r.center.x / f.w - pts[0].x, dy: r.center.y / f.h - pts[0].y, width: r.width / f.w, at: now };
+  const o = state.forearm;
+  if (o && now - o.at < 500) {
+    const k = 0.35;
+    let ax = o.axis.x * (1 - k) + v.axis.x * k;
+    let ay = o.axis.y * (1 - k) + v.axis.y * k;
+    const l = Math.hypot(ax, ay) || 1;
+    state.forearm = { axis: { x: ax / l, y: ay / l }, dx: o.dx * (1 - k) + v.dx * k, dy: o.dy * (1 - k) + v.dy * k, width: o.width * (1 - k) + v.width * k, at: now };
+  } else state.forearm = v;
+}
+
 // 手认不出时，跟着手腕皮肤的纹理（痣、汗毛、明暗）移动手链，最多 3 秒
 const trackCanvas = document.createElement('canvas');
 const trackCtx = trackCanvas.getContext('2d', { willReadFrequently: true });
+let trackCache = null;
 function trackFrame() {
+  // 同一帧画面只取一次像素
+  if (trackCache && trackCache.time === video.currentTime) return trackCache;
   const vw = video.videoWidth;
   const vh = video.videoHeight;
   const s = 240 / Math.max(vw, vh);
@@ -374,7 +410,8 @@ function trackFrame() {
     trackCanvas.height = h;
   }
   trackCtx.drawImage(video, 0, 0, w, h);
-  return { bytes: trackCtx.getImageData(0, 0, w, h).data, w, h };
+  trackCache = { bytes: trackCtx.getImageData(0, 0, w, h).data, w, h, time: video.currentTime };
+  return trackCache;
 }
 function followSkin(now) {
   if (!state.trackPoint) return false;
@@ -404,6 +441,24 @@ function followSkin(now) {
   state.last = state.last.map(move);
   if (state.shown) state.shown = state.shown.map(move);
   state.trackPoint = move(state.trackPoint);
+  // 跟到的地方不像皮肤了（手已经移走），就不跟了
+  if (state.skinM) {
+    // 中心周围取 5 个点，至少 4 个不像皮肤才算跟丢（只看画面内的点）
+    let bad = 0;
+    let seen = 0;
+    for (const [ox, oy] of [[0, 0], [6, 0], [-6, 0], [0, 6], [0, -6]]) {
+      const px = Math.round(state.trackPoint.x * f.w + ox);
+      const py = Math.round(state.trackPoint.y * f.h + oy);
+      if (px < 0 || py < 0 || px >= f.w || py >= f.h) continue;
+      seen++;
+      if (!isSkin(f.bytes, (py * f.w + px) * 4, state.skinM)) bad++;
+    }
+    if (seen >= 3 && bad >= Math.min(4, seen)) {
+      state.patch = null;
+      state.trackPoint = null;
+      return false;
+    }
+  }
   state.patch = grabPatch(f.bytes, f.w, f.h, state.trackPoint.x * f.w, state.trackPoint.y * f.h);
   state.skinOkAt = now;
   return !!state.patch;
@@ -422,9 +477,10 @@ function onResults(res) {
   }
   const hd0 = res.multiHandedness && res.multiHandedness[0];
   // 新认出一只手时更严格：把握要高，而且连续两帧都认出，才开始戴手链（减少把海报、人脸认成手）
+  // （左右手的把握度不是“是不是手”的把握度，0.10 用它卡住了手掌正对镜头的情况，已去掉）
   if (!state.last || state.trackingSkin) {
-    const score = hd0 && hd0.score != null ? hd0.score : 1;
-    if (score < 0.75 || !plausibleHand(lm)) {
+    const pl = plausibleHand(lm);
+    if (!pl || !palmLooksLikeSkin(lm)) {
       state.acq = 0;
       return;
     }
@@ -450,16 +506,17 @@ function onResults(res) {
       if (state.roll > Math.PI) state.roll -= 2 * Math.PI;
       if (state.roll < -Math.PI) state.roll += 2 * Math.PI;
     }
-    let pt = h.pitch * PITCH_GAIN;
-    pt = Math.abs(pt) < PITCH_DEAD ? 0 : pt - Math.sign(pt) * PITCH_DEAD;
-    pt = Math.max(-PITCH_MAX, Math.min(PITCH_MAX, pt));
-    state.pitch = state.pitch * 0.7 + pt * 0.3;
+    // 前臂的前后倾斜：手部模型只能量手掌的倾斜，手腕一弯（握拳上翘）就和前臂差很多，
+    // 0.10 真机录像里因此弯反了方向。自己拍手腕时，几乎总是手肘离镜头近、手离镜头远，
+    // 所以固定按“手那头远一点”（sin≈0.3）来画，弧线朝手的方向微微拱起，像套在手腕上
+    state.pitch = FOREARM_TILT;
     state.cosPitch = Math.sqrt(1 - Math.min(0.8, Math.abs(h.pitch)) ** 2);
     state.spinDir = h.spinDir;
     state.dbg = { pitchRaw: +h.pitch.toFixed(2), roll: Math.round((h.roll * 180) / Math.PI), hand: hand.label };
   }
   state.last = pts;
   state.lastSeen = now;
+  updateForearm(lm, now);
 }
 
 // ---------- 画面 ----------
@@ -494,7 +551,10 @@ function wristScale(pose, W, H) {
   const P = state.shown;
   const kn = Math.hypot((P[5].x - P[17].x) * W, (P[5].y - P[17].y) * H);
   const palm = pose.palmPx / Math.max(0.6, state.cosPitch || 1);
-  const wristPx = Math.max(KNUCKLE_TO_WRIST * kn, PALM_TO_WRIST * palm);
+  let wristPx = Math.max(KNUCKLE_TO_WRIST * kn, PALM_TO_WRIST * palm);
+  const fa = state.forearm;
+  // 量到了前臂实际宽度就以它为准（只允许在推算值的 0.6–1.3 倍之间，防止量错）
+  if (fa && performance.now() - fa.at < 600) wristPx = Math.max(0.6 * wristPx, Math.min(1.3 * wristPx, fa.width * W));
   const target = wristPx / (2 * core.BODY.wristSemiBreadth(pose.wristMm));
   state.scale = state.scale ? state.scale * 0.7 + target * 0.3 : target;
   return state.scale;
@@ -517,6 +577,25 @@ function drawFrame() {
     let pose = core.estimateWristPose(state.shown, W, H, state.wristCm * 10);
     if (pose) {
       pose = Object.assign({}, pose, { pxPerMm: wristScale(pose, W, H) });
+      // 方向和中线跟着前臂走（手腕弯的时候手掌方向不准）
+      const fa = state.forearm;
+      let tAxis = pose.axis;
+      let tWrist = pose.wrist;
+      if (fa && now - fa.at < 600) {
+        tAxis = fa.axis;
+        tWrist = { x: (state.shown[0].x + fa.dx) * W, y: (state.shown[0].y + fa.dy) * H };
+      }
+      // 前臂量得到/量不到来回切换时不要跳：方向和中心都平滑过渡
+      const sm = state.poseSm;
+      if (sm) {
+        let ax = sm.axis.x * 0.75 + tAxis.x * 0.25;
+        let ay = sm.axis.y * 0.75 + tAxis.y * 0.25;
+        const l = Math.hypot(ax, ay) || 1;
+        state.poseSm = { axis: { x: ax / l, y: ay / l }, wrist: { x: sm.wrist.x * 0.6 + tWrist.x * 0.4, y: sm.wrist.y * 0.6 + tWrist.y * 0.4 } };
+      } else state.poseSm = { axis: tAxis, wrist: tWrist };
+      pose.axis = state.poseSm.axis;
+      pose.normal = { x: -pose.axis.y, y: pose.axis.x };
+      pose.wrist = state.poseSm.wrist;
       const list = beads();
       let rotate = 0;
       if (state.roll != null && state.spinDir) {
@@ -526,9 +605,14 @@ function drawFrame() {
         rotate = (sign * (state.roll - Math.PI)) / (2 * Math.PI);
       }
       const layout = core.computeLayout({ pose, beads: list, pitch3d: state.pitch, adjust: { rotate } });
+      // 背面的珠子都不画：在手腕两侧露出来的背面珠子会和正面珠子叠成一团（0.10 真机录像）
+      layout.beads.forEach((b) => {
+        if (b.back) b.hidden = true;
+      });
       ctx.globalAlpha = age < HOLD_MS ? 1 : Math.max(0, 1 - (age - HOLD_MS) / FADE_MS);
       render.drawTryon(ctx, layout, state.images, { width: W, height: H, shadow: true });
       state.drawn = now;
+      state.dbgBand = { cx: layout.band.cx, cy: layout.band.cy, ang: Math.atan2(layout.band.ny, layout.band.nx), w: layout.band.halfWidth, t: now };
       state.dbgPose = { palmPx: Math.round(pose.palmPx), pxPerMm: +pose.pxPerMm.toFixed(2), halfW: Math.round(layout.band.halfWidth), pitch: +state.pitch.toFixed(2), poseRoll: Math.round((pose.roll * 180) / Math.PI) };
       // 记住手链中心（0–1 坐标），手认不出时从这里开始跟皮肤
       if (now - state.lastSeen < 150) state.trackPoint = { x: layout.band.cx / W, y: layout.band.cy / H };
@@ -539,6 +623,8 @@ function drawFrame() {
     state.shown = null;
     state.roll = null;
     state.scale = 0;
+    state.poseSm = null;
+    state.forearm = null;
     state.patch = null;
     state.trackPoint = null;
     state.trackingSkin = false;
@@ -788,7 +874,7 @@ $('debugBtn').onclick = () => {
   updateLabels();
 };
 $('modelBtn').onclick = () => {
-  const q = new URLSearchParams({ engine: state.engineName === 'A' ? 'B' : 'A', auto: '1', v: '10' });
+  const q = new URLSearchParams({ engine: state.engineName === 'A' ? 'B' : 'A', auto: '1', v: '11' });
   location.replace(location.pathname + '?' + q.toString());
 };
 $('wristMinus').onclick = () => {
