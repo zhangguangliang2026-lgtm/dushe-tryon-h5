@@ -1,6 +1,6 @@
 /**
  * 独奢 · 手链 AR 试戴测试页（网页版）
- * 手部识别：MediaPipe Hands（谷歌开源，Apache 2.0，模型文件随页面一起放在 ./mediapipe/，在手机本地运行）
+ * 手部识别：MediaPipe（谷歌开源，Apache 2.0），方案 A 旧版 Hands / 方案 B 新版 Tasks（CPU），都在手机本地运行
  * 手链排布与绘制：沿用小程序原型的 tryon-core / tryon-render
  */
 const core = require('./lib/tryon-core');
@@ -80,7 +80,7 @@ function setStatus(text, isError) {
 
 function updateLabels() {
   $('sampleName').textContent = SAMPLES[state.sample].title + ' · 手围 ' + state.wristCm + 'cm';
-  $('modelBtn').textContent = state.delegate === 'CPU' ? '计算：CPU' : '计算：显卡';
+  $('modelBtn').textContent = '识别方案 ' + (state.engineName || '-');
   $('debugBtn').textContent = state.debug ? '关调试' : '调试点';
   $('fitBtn').textContent = state.fit === 'cover' ? '画面：铺满' : '画面：完整';
   $('camBtn').textContent = state.facing === 'user' ? '换后置' : '换前置';
@@ -89,64 +89,237 @@ function updateLabels() {
 }
 
 // ---------- 识别 ----------
-// 识别引擎：MediaPipe Tasks HandLandmarker。默认用 CPU 计算（华为麒麟手机上旧版用显卡计算会卡死）
-let landmarker = null;
-let fileset = null;
-let modelBuf = null;
-async function createLandmarker(delegate) {
-  const vision = await waitVision();
-  if (!fileset) fileset = await vision.FilesetResolver.forVisionTasks('./tasks/wasm');
-  const lm = await vision.HandLandmarker.createFromOptions(fileset, {
-    baseOptions: { modelAssetBuffer: modelBuf, delegate },
-    runningMode: 'VIDEO',
-    numHands: 1,
-    minHandDetectionConfidence: 0.5,
-    minHandPresenceConfidence: 0.5,
-    minTrackingConfidence: 0.5,
-  });
-  if (landmarker) landmarker.close();
-  landmarker = lm;
+// 大文件从国内的 npm 镜像（阿里云 npmmirror）下载；GitHub 在国内手机上很慢，下到一半会断。
+const NPM = 'https://registry.npmmirror.com/';
+const LEGACY_BASES = [NPM + '@mediapipe/hands/0.4.1675469240/files/', './mediapipe/'];
+const TASKS_BASES = [NPM + '@mediapipe/tasks-vision/1.2.2/files/', './tasks/'];
+// 手部模型：npmmirror 不直接提供这个包里的单个文件，但提供整个包的压缩包（国内 CDN），下载后在手机上解压取出模型
+const MODEL_TGZ = NPM + '@beautinique/frontend-tryon-assets/-/frontend-tryon-assets-1.0.2.tgz';
+const MODEL_URLS = [
+  MODEL_TGZ,
+  './models/hand_landmarker.task',
+  'https://cdn.jsdelivr.net/gh/zhangguangliang2026-lgtm/dushe-tryon-h5@main/models/hand_landmarker.task',
+  'https://testingcf.jsdelivr.net/gh/zhangguangliang2026-lgtm/dushe-tryon-h5@main/models/hand_landmarker.task',
+];
+
+function withTimeout(p, ms, what) {
+  return Promise.race([
+    p,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(what + '超过 ' + Math.round(ms / 1000) + ' 秒没有完成')), ms)),
+  ]);
 }
-function waitVision() {
-  if (window.__vision) return Promise.resolve(window.__vision);
+
+function loadScript(url) {
   return new Promise((resolve, reject) => {
-    window.addEventListener('vision-ready', () => resolve(window.__vision), { once: true });
-    window.addEventListener('vision-error', () => reject(new Error('识别程序加载失败')), { once: true });
+    const el = document.createElement('script');
+    el.src = url;
+    el.crossOrigin = 'anonymous';
+    el.onload = resolve;
+    el.onerror = () => reject(new Error('脚本加载失败 ' + url));
+    document.head.appendChild(el);
   });
 }
-// 新引擎的结果换成旧格式，后面的代码不用改
-function toLegacy(r) {
+
+// 方案 A：MediaPipe Hands（旧版，文件约 12MB，全部走国内镜像）
+function legacyEngine(base) {
+  let hands = null;
+  let pending = null;
   return {
-    multiHandLandmarks: r.landmarks || [],
-    multiHandWorldLandmarks: r.worldLandmarks || [],
-    multiHandedness: (r.handedness || []).map((h) => ({ label: h[0] && h[0].categoryName, score: h[0] && h[0].score })),
+    name: 'A',
+    async load() {
+      if (!window.Hands) await withTimeout(loadScript(base + 'hands.js'), 20000, '方案A脚本');
+      hands = new window.Hands({ locateFile: (f) => base + f });
+      hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+      hands.onResults((r) => {
+        if (pending) pending(r);
+      });
+      await withTimeout(hands.initialize(), 60000, '方案A模型加载');
+    },
+    detect(input) {
+      return new Promise((resolve, reject) => {
+        pending = (r) => {
+          pending = null;
+          resolve(r);
+        };
+        hands.send({ image: input }).then(() => {
+          // send 结束时一般已经回调过；没回调说明这帧没有结果
+          if (pending) {
+            pending = null;
+            resolve({});
+          }
+        }, reject);
+      });
+    },
+    close() {
+      try {
+        if (hands) hands.close();
+      } catch (e) {}
+    },
   };
 }
-// 带进度下载
-async function fetchWithProgress(url, label) {
-  const res = await fetch(url, { cache: 'force-cache' });
-  if (!res.ok) throw new Error(label + ' 下载失败 HTTP ' + res.status);
-  const reader = res.body.getReader();
-  const parts = [];
-  let got = 0;
-  let shown = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    parts.push(value);
-    got += value.length;
-    if (performance.now() - shown > 250) {
-      shown = performance.now();
-      setStatus('正在下载' + label + ' ' + (got / 1048576).toFixed(1) + 'MB…（只有第一次需要）');
+
+// 方案 B：MediaPipe Tasks（新版），CPU 计算，不经过显卡
+async function fetchModel() {
+  // 三个来源同时下，谁先下完用谁
+  const ctrls = MODEL_URLS.map(() => new AbortController());
+  const got = MODEL_URLS.map(() => 0);
+  const timer = setInterval(() => {
+    setStatus('正在下载手部模型 ' + (Math.max.apply(null, got) / 1048576).toFixed(1) + 'MB…（只有第一次需要）');
+  }, 300);
+  try {
+    return await Promise.any(
+      MODEL_URLS.map(async (u, i) => {
+        const res = await fetch(u, { signal: ctrls[i].signal });
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const reader = res.body.getReader();
+        const parts = [];
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          parts.push(value);
+          got[i] += value.length;
+        }
+        let buf = new Uint8Array(got[i]);
+        let o = 0;
+        for (const part of parts) {
+          buf.set(part, o);
+          o += part.length;
+        }
+        if (u === MODEL_TGZ) buf = await untarModel(buf);
+        ctrls.forEach((c, j) => j !== i && c.abort());
+        log('手部模型来自 ' + ['国内镜像', 'GitHub', 'jsDelivr', 'jsDelivr-CF'][i] + ' ' + ((performance.now() - T0) / 1000).toFixed(1) + 's');
+        return buf;
+      })
+    );
+  } catch (e) {
+    throw new Error('手部模型三个来源都下载失败');
+  } finally {
+    clearInterval(timer);
+  }
+}
+
+// 解压 .tgz，取出 package/models/hand_landmarker.task
+async function untarModel(gz) {
+  const tar = new Uint8Array(await new Response(new Blob([gz]).stream().pipeThrough(new DecompressionStream('gzip'))).arrayBuffer());
+  const dec = new TextDecoder();
+  let off = 0;
+  while (off + 512 <= tar.length) {
+    const name = dec.decode(tar.subarray(off, off + 100)).split('\0')[0];
+    if (!name) break;
+    const size = parseInt(dec.decode(tar.subarray(off + 124, off + 136)).split('\0')[0].trim(), 8) || 0;
+    if (name === 'package/models/hand_landmarker.task') {
+      const out = tar.slice(off + 512, off + 512 + size);
+      if (out.length !== 7819105) throw new Error('模型大小不对 ' + out.length);
+      return out;
+    }
+    off += 512 + Math.ceil(size / 512) * 512;
+  }
+  throw new Error('压缩包里没有手部模型');
+}
+
+function tasksEngine(delegate) {
+  let lm = null;
+  let lastTs = 0;
+  return {
+    name: 'B',
+    async load() {
+      let vision = null;
+      let base = null;
+      for (const b of TASKS_BASES) {
+        try {
+          vision = await withTimeout(window.__loadVision(b + 'vision_bundle.mjs'), 20000, '方案B脚本');
+          base = b;
+          break;
+        } catch (e) {
+          log('方案B脚本 ' + b + ' 失败 ' + e.message);
+        }
+      }
+      if (!vision) throw new Error('方案B脚本加载失败');
+      const fileset = await withTimeout(vision.FilesetResolver.forVisionTasks(base + 'wasm'), 60000, '方案B运行库');
+      const model = await fetchModel();
+      lm = await withTimeout(
+        vision.HandLandmarker.createFromOptions(fileset, {
+          baseOptions: { modelAssetBuffer: model, delegate },
+          runningMode: 'VIDEO',
+          numHands: 1,
+        }),
+        60000,
+        '方案B模型启动'
+      );
+    },
+    detect(input) {
+      const ts = Math.max(performance.now(), lastTs + 1);
+      lastTs = ts;
+      const r = lm.detectForVideo(input, ts);
+      return Promise.resolve({
+        multiHandLandmarks: r.landmarks || [],
+        multiHandWorldLandmarks: r.worldLandmarks || [],
+        multiHandedness: (r.handedness || []).map((h) => ({ label: h[0] && h[0].categoryName, score: h[0] && h[0].score })),
+      });
+    },
+    close() {
+      try {
+        if (lm) lm.close();
+      } catch (e) {}
+    },
+  };
+}
+
+let engine = null;
+// 依次尝试：A 镜像 → B → A 本站。每个方案都要在真实画面上识别成功才算数
+async function loadEngine(order) {
+  state.modelReady = false;
+  for (const make of order) {
+    const eng = make();
+    const t0 = performance.now();
+    log('加载方案' + eng.name + '…');
+    setStatus('正在加载识别方案 ' + eng.name + '（第一次需要下载，约十几 MB）…');
+    try {
+      await eng.load();
+      log('方案' + eng.name + ' 加载完成 ' + ((performance.now() - t0) / 1000).toFixed(1) + 's');
+      if (engine) engine.close();
+      engine = eng;
+      state.engineName = eng.name;
+      state.engineFails = 0;
+      state.engineStart = performance.now();
+      state.firstResult = false;
+      state.modelReady = true;
+      updateLabels();
+      return true;
+    } catch (e) {
+      log('方案' + eng.name + ' 失败：' + e.message);
+      eng.close();
     }
   }
-  const buf = new Uint8Array(got);
-  let o = 0;
-  for (const part of parts) {
-    buf.set(part, o);
-    o += part.length;
+  return false;
+}
+// 两个方案的运行库放在同一个页面里会冲突，所以换方案时重新打开页面（带上参数自动开始）
+const params = new URLSearchParams(location.search);
+const WANT = params.get('engine') === 'A' ? 'A' : 'B';
+const ORDER_ALL =
+  WANT === 'A'
+    ? [() => legacyEngine(LEGACY_BASES[0]), () => legacyEngine(LEGACY_BASES[1])]
+    : [() => tasksEngine('CPU')];
+function reloadWith(engineName, reason) {
+  const tried = (params.get('tried') || '').split(',').filter(Boolean);
+  if (tried.indexOf(engineName) >= 0) return false;
+  tried.push(WANT);
+  log('换方案' + engineName + '：' + reason);
+  const q = new URLSearchParams({ engine: engineName, auto: '1', tried: tried.join(','), why: '方案' + WANT + ' ' + reason, v: '8' });
+  setTimeout(() => location.replace(location.pathname + '?' + q.toString()), 800);
+  return true;
+}
+
+// 识别出错或卡住：换另一个方案
+async function engineFailed(msg) {
+  log('方案' + state.engineName + ' 识别' + msg);
+  state.engineFails = (state.engineFails || 0) + 1;
+  if (state.engineFails < 2 && !/秒/.test(msg)) return;
+  state.modelReady = false;
+  if (!reloadWith(state.engineName === 'A' ? 'B' : 'A', msg)) {
+    state.errText = '方案' + state.engineName + ' ' + msg;
+    $('log').style.display = 'block';
   }
-  return buf;
 }
 
 // 左右手判断偶尔会在两帧之间跳变，跳一次手链就会转半圈，所以要连续多帧都变了才认
@@ -260,7 +433,7 @@ function drawFrame() {
   if (now - state.since > 1000) {
     const sec = (now - state.since) / 1000;
     $('fps').textContent =
-      (state.src === 'canvas' ? '[画布] ' : '') + Math.round(state.frames / sec) + ' 帧/秒 · 识别 ' + Math.round(state.detects / sec) + ' 次/秒 · 认出 ' + Math.round(state.hits / sec) + ' · ' + Math.round(state.detectMs) + 'ms';
+      '方案' + (state.engineName || '-') + ' · ' + Math.round(state.frames / sec) + ' 帧/秒 · 识别 ' + Math.round(state.detects / sec) + ' 次/秒 · 认出 ' + Math.round(state.hits / sec) + ' · ' + Math.round(state.detectMs) + 'ms';
     if (state.debug) {
       $('fps').textContent += ' · ' + video.videoWidth + '×' + video.videoHeight + ' · ' + state.camLabel;
       if (state.roll != null) $('fps').textContent += ' · 转 ' + Math.round((state.roll * 180) / Math.PI) + '°';
@@ -274,57 +447,33 @@ function drawFrame() {
   }
 }
 
-// 有的手机浏览器不能把摄像头画面直接交给识别（WebGL 读不到视频），这时先画到画布上再交
-const srcCanvas = document.createElement('canvas');
-function detectInput() {
-  if (state.src !== 'canvas') return video;
-  const s = Math.min(1, 640 / Math.max(video.videoWidth, video.videoHeight));
-  const w = Math.round(video.videoWidth * s);
-  const h = Math.round(video.videoHeight * s);
-  if (srcCanvas.width !== w || srcCanvas.height !== h) {
-    srcCanvas.width = w;
-    srcCanvas.height = h;
-  }
-  srcCanvas.getContext('2d').drawImage(video, 0, 0, w, h);
-  return srcCanvas;
-}
-function detectFailed(msg, src) {
-  log(msg + '（' + (src === 'canvas' ? '画布' : '视频') + '）');
-  if (src !== 'canvas') {
-    state.src = 'canvas';
-    log('改用画布方式识别');
-  } else {
-    state.errText = msg;
-    $('log').style.display = 'block';
-  }
-}
-
 async function loop() {
   if (!state.running) return;
   if (video.readyState >= 2) {
     layoutCanvas();
     drawFrame();
-    if (!state.busy && state.modelReady && !state.switching) {
+    if (!state.busy && state.modelReady && !state.switching && engine) {
       state.busy = true;
       const t0 = performance.now();
-      const myRun = (state.runId = (state.runId || 0) + 1);
-      const src = state.src;
+      const eng = engine;
+      let done = false;
       const guard = setTimeout(() => {
-        if (state.runId !== myRun) return;
-        detectFailed('识别超过 5 秒没返回', src);
+        if (done || eng !== engine) return;
         state.busy = false;
-      }, 5000);
+        engineFailed('超过 6 秒没返回');
+      }, 6000);
       Promise.resolve()
-        .then(() => {
-          const ts = Math.max(performance.now(), (state.lastTs || 0) + 1);
-          state.lastTs = ts;
-          onResults(toLegacy(landmarker.detectForVideo(detectInput(), ts)));
+        .then(() => eng.detect(video))
+        .then((r) => {
+          if (eng !== engine) return;
+          onResults(r);
           state.detectMs = state.detectMs * 0.8 + (performance.now() - t0) * 0.2;
         })
-        .catch((e) => detectFailed('识别出错 ' + ((e && e.message) || e), src))
+        .catch((e) => eng === engine && engineFailed('出错 ' + ((e && e.message) || e)))
         .finally(() => {
+          done = true;
           clearTimeout(guard);
-          state.busy = false;
+          if (eng === engine) state.busy = false;
         });
     }
   }
@@ -441,6 +590,7 @@ async function startCamera() {
       state.switching = false;
       setButtons(true);
       $('start').style.display = 'none';
+      if (!state.engineStart) state.engineStart = performance.now();
       setStatus(state.modelReady ? '' : '正在加载识别模型…');
       if (!state.running) {
         state.running = true;
@@ -461,26 +611,7 @@ async function startCamera() {
 }
 
 function setButtons(on) {
-  ['camBtn', 'lensBtn'].forEach((id) => ($(id).disabled = !on));
-}
-
-// 模型先加载好，再开摄像头，免得加载时页面卡住
-async function loadModel() {
-  const t0 = performance.now();
-  log('开始加载识别模型');
-  try {
-    await fetchWithProgress('./tasks/wasm/vision_wasm_internal.wasm', '识别程序（约 14MB）');
-    log('识别程序下载完成 ' + ((performance.now() - t0) / 1000).toFixed(1) + 's');
-    if (!modelBuf) modelBuf = await fetchWithProgress('./models/hand_landmarker.task', '手部模型（约 8MB）');
-    log('手部模型下载完成 ' + ((performance.now() - t0) / 1000).toFixed(1) + 's');
-    setStatus('正在启动识别…');
-    await createLandmarker(state.delegate);
-    state.modelReady = true;
-    log('模型加载完成 ' + ((performance.now() - t0) / 1000).toFixed(1) + 's');
-  } catch (e) {
-    log('模型加载失败 ' + (e && e.message));
-    setStatus('识别模型加载失败：' + (e && e.message) + '。请检查网络后刷新', true);
-  }
+  ['camBtn', 'lensBtn', 'modelBtn'].forEach((id) => ($(id).disabled = !on));
 }
 
 // ---------- 按钮 ----------
@@ -489,16 +620,23 @@ $('start').onclick = async () => {
   $('log').style.display = 'block';
   setStatus('正在加载识别模型（首次约 8MB，网络慢时要等一会）…');
   await loadBeadImages();
-  await loadModel();
-  if (!state.modelReady) {
+  if (!(await loadEngine(ORDER_ALL))) {
+    if (reloadWith(WANT === 'A' ? 'B' : 'A', '加载失败')) return;
+    setStatus('识别方案都加载失败，请截图发给开发，然后刷新再试', true);
     $('start').disabled = false;
     return;
   }
   setStatus('正在打开摄像头…');
   await startCamera();
-  setTimeout(() => {
-    if (!state.debug) $('log').style.display = 'none';
-  }, 8000);
+  // 第一次识别成功后才收起记录，没成功就一直显示，方便截图
+  const hide = setInterval(() => {
+    if (state.firstResult && !state.errText) {
+      clearInterval(hide);
+      setTimeout(() => {
+        if (!state.debug) $('log').style.display = 'none';
+      }, 3000);
+    }
+  }, 500);
 };
 $('lensBtn').onclick = () => {
   // 只在后置的几个镜头之间切换，挑一个能拍到整个手腕的
@@ -528,19 +666,9 @@ $('debugBtn').onclick = () => {
   $('log').style.display = state.debug ? 'block' : 'none';
   updateLabels();
 };
-$('modelBtn').onclick = async () => {
-  if (!state.modelReady) return;
-  state.modelReady = false;
-  const next = state.delegate === 'CPU' ? 'GPU' : 'CPU';
-  log('切换到' + (next === 'CPU' ? 'CPU' : '显卡') + '计算');
-  try {
-    await createLandmarker(next);
-    state.delegate = next;
-  } catch (e) {
-    log('切换失败 ' + e.message);
-  }
-  state.modelReady = true;
-  updateLabels();
+$('modelBtn').onclick = () => {
+  const q = new URLSearchParams({ engine: state.engineName === 'A' ? 'B' : 'A', auto: '1', v: '8' });
+  location.replace(location.pathname + '?' + q.toString());
 };
 $('wristMinus').onclick = () => {
   state.wristCm = Math.max(13, state.wristCm - 0.5);
@@ -557,7 +685,10 @@ $('shotBtn').onclick = () => {
 };
 $('shotBox').onclick = () => ($('shotBox').style.display = 'none');
 window.addEventListener('resize', layoutCanvas);
+setButtons(false); // 识别准备好之前不能开摄像头
 updateLabels();
 setStatus('点下面的按钮打开摄像头');
 // 测试用：自动化验证时直接注入识别结果
 window.__tryon = { state, onResults, drawFrame, layoutCanvas, startCamera };
+if (params.get('why')) log('上一次：' + params.get('why') + '，已自动换方案');
+if (params.get('auto') === '1') setTimeout(() => $('start').click(), 300);

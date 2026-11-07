@@ -726,68 +726,225 @@
   }
   function updateLabels() {
     $("sampleName").textContent = SAMPLES[state.sample].title + " \xB7 \u624B\u56F4 " + state.wristCm + "cm";
-    $("modelBtn").textContent = state.delegate === "CPU" ? "\u8BA1\u7B97\uFF1ACPU" : "\u8BA1\u7B97\uFF1A\u663E\u5361";
+    $("modelBtn").textContent = "\u8BC6\u522B\u65B9\u6848 " + (state.engineName || "-");
     $("debugBtn").textContent = state.debug ? "\u5173\u8C03\u8BD5" : "\u8C03\u8BD5\u70B9";
     $("fitBtn").textContent = state.fit === "cover" ? "\u753B\u9762\uFF1A\u94FA\u6EE1" : "\u753B\u9762\uFF1A\u5B8C\u6574";
     $("camBtn").textContent = state.facing === "user" ? "\u6362\u540E\u7F6E" : "\u6362\u524D\u7F6E";
     const n = (state.backCams || []).length;
     $("lensBtn").textContent = n > 1 && state.facing !== "user" ? "\u955C\u5934 " + (state.backIndex + 1) + "/" + n : "\u6362\u955C\u5934";
   }
-  var landmarker = null;
-  var fileset = null;
-  var modelBuf = null;
-  async function createLandmarker(delegate) {
-    const vision = await waitVision();
-    if (!fileset) fileset = await vision.FilesetResolver.forVisionTasks("./tasks/wasm");
-    const lm = await vision.HandLandmarker.createFromOptions(fileset, {
-      baseOptions: { modelAssetBuffer: modelBuf, delegate },
-      runningMode: "VIDEO",
-      numHands: 1,
-      minHandDetectionConfidence: 0.5,
-      minHandPresenceConfidence: 0.5,
-      minTrackingConfidence: 0.5
-    });
-    if (landmarker) landmarker.close();
-    landmarker = lm;
+  var NPM = "https://registry.npmmirror.com/";
+  var LEGACY_BASES = [NPM + "@mediapipe/hands/0.4.1675469240/files/", "./mediapipe/"];
+  var TASKS_BASES = [NPM + "@mediapipe/tasks-vision/1.2.2/files/", "./tasks/"];
+  var MODEL_TGZ = NPM + "@beautinique/frontend-tryon-assets/-/frontend-tryon-assets-1.0.2.tgz";
+  var MODEL_URLS = [
+    MODEL_TGZ,
+    "./models/hand_landmarker.task",
+    "https://cdn.jsdelivr.net/gh/zhangguangliang2026-lgtm/dushe-tryon-h5@main/models/hand_landmarker.task",
+    "https://testingcf.jsdelivr.net/gh/zhangguangliang2026-lgtm/dushe-tryon-h5@main/models/hand_landmarker.task"
+  ];
+  function withTimeout(p, ms, what) {
+    return Promise.race([
+      p,
+      new Promise((_, rej) => setTimeout(() => rej(new Error(what + "\u8D85\u8FC7 " + Math.round(ms / 1e3) + " \u79D2\u6CA1\u6709\u5B8C\u6210")), ms))
+    ]);
   }
-  function waitVision() {
-    if (window.__vision) return Promise.resolve(window.__vision);
+  function loadScript(url) {
     return new Promise((resolve, reject) => {
-      window.addEventListener("vision-ready", () => resolve(window.__vision), { once: true });
-      window.addEventListener("vision-error", () => reject(new Error("\u8BC6\u522B\u7A0B\u5E8F\u52A0\u8F7D\u5931\u8D25")), { once: true });
+      const el = document.createElement("script");
+      el.src = url;
+      el.crossOrigin = "anonymous";
+      el.onload = resolve;
+      el.onerror = () => reject(new Error("\u811A\u672C\u52A0\u8F7D\u5931\u8D25 " + url));
+      document.head.appendChild(el);
     });
   }
-  function toLegacy(r) {
+  function legacyEngine(base) {
+    let hands = null;
+    let pending = null;
     return {
-      multiHandLandmarks: r.landmarks || [],
-      multiHandWorldLandmarks: r.worldLandmarks || [],
-      multiHandedness: (r.handedness || []).map((h) => ({ label: h[0] && h[0].categoryName, score: h[0] && h[0].score }))
+      name: "A",
+      async load() {
+        if (!window.Hands) await withTimeout(loadScript(base + "hands.js"), 2e4, "\u65B9\u6848A\u811A\u672C");
+        hands = new window.Hands({ locateFile: (f) => base + f });
+        hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+        hands.onResults((r) => {
+          if (pending) pending(r);
+        });
+        await withTimeout(hands.initialize(), 6e4, "\u65B9\u6848A\u6A21\u578B\u52A0\u8F7D");
+      },
+      detect(input) {
+        return new Promise((resolve, reject) => {
+          pending = (r) => {
+            pending = null;
+            resolve(r);
+          };
+          hands.send({ image: input }).then(() => {
+            if (pending) {
+              pending = null;
+              resolve({});
+            }
+          }, reject);
+        });
+      },
+      close() {
+        try {
+          if (hands) hands.close();
+        } catch (e) {
+        }
+      }
     };
   }
-  async function fetchWithProgress(url, label) {
-    const res = await fetch(url, { cache: "force-cache" });
-    if (!res.ok) throw new Error(label + " \u4E0B\u8F7D\u5931\u8D25 HTTP " + res.status);
-    const reader = res.body.getReader();
-    const parts = [];
-    let got = 0;
-    let shown = 0;
-    for (; ; ) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      parts.push(value);
-      got += value.length;
-      if (performance.now() - shown > 250) {
-        shown = performance.now();
-        setStatus("\u6B63\u5728\u4E0B\u8F7D" + label + " " + (got / 1048576).toFixed(1) + "MB\u2026\uFF08\u53EA\u6709\u7B2C\u4E00\u6B21\u9700\u8981\uFF09");
+  async function fetchModel() {
+    const ctrls = MODEL_URLS.map(() => new AbortController());
+    const got = MODEL_URLS.map(() => 0);
+    const timer = setInterval(() => {
+      setStatus("\u6B63\u5728\u4E0B\u8F7D\u624B\u90E8\u6A21\u578B " + (Math.max.apply(null, got) / 1048576).toFixed(1) + "MB\u2026\uFF08\u53EA\u6709\u7B2C\u4E00\u6B21\u9700\u8981\uFF09");
+    }, 300);
+    try {
+      return await Promise.any(
+        MODEL_URLS.map(async (u, i) => {
+          const res = await fetch(u, { signal: ctrls[i].signal });
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          const reader = res.body.getReader();
+          const parts = [];
+          for (; ; ) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            parts.push(value);
+            got[i] += value.length;
+          }
+          let buf = new Uint8Array(got[i]);
+          let o = 0;
+          for (const part of parts) {
+            buf.set(part, o);
+            o += part.length;
+          }
+          if (u === MODEL_TGZ) buf = await untarModel(buf);
+          ctrls.forEach((c, j) => j !== i && c.abort());
+          log("\u624B\u90E8\u6A21\u578B\u6765\u81EA " + ["\u56FD\u5185\u955C\u50CF", "GitHub", "jsDelivr", "jsDelivr-CF"][i] + " " + ((performance.now() - T0) / 1e3).toFixed(1) + "s");
+          return buf;
+        })
+      );
+    } catch (e) {
+      throw new Error("\u624B\u90E8\u6A21\u578B\u4E09\u4E2A\u6765\u6E90\u90FD\u4E0B\u8F7D\u5931\u8D25");
+    } finally {
+      clearInterval(timer);
+    }
+  }
+  async function untarModel(gz) {
+    const tar = new Uint8Array(await new Response(new Blob([gz]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer());
+    const dec = new TextDecoder();
+    let off = 0;
+    while (off + 512 <= tar.length) {
+      const name = dec.decode(tar.subarray(off, off + 100)).split("\0")[0];
+      if (!name) break;
+      const size = parseInt(dec.decode(tar.subarray(off + 124, off + 136)).split("\0")[0].trim(), 8) || 0;
+      if (name === "package/models/hand_landmarker.task") {
+        const out = tar.slice(off + 512, off + 512 + size);
+        if (out.length !== 7819105) throw new Error("\u6A21\u578B\u5927\u5C0F\u4E0D\u5BF9 " + out.length);
+        return out;
+      }
+      off += 512 + Math.ceil(size / 512) * 512;
+    }
+    throw new Error("\u538B\u7F29\u5305\u91CC\u6CA1\u6709\u624B\u90E8\u6A21\u578B");
+  }
+  function tasksEngine(delegate) {
+    let lm = null;
+    let lastTs = 0;
+    return {
+      name: "B",
+      async load() {
+        let vision = null;
+        let base = null;
+        for (const b of TASKS_BASES) {
+          try {
+            vision = await withTimeout(window.__loadVision(b + "vision_bundle.mjs"), 2e4, "\u65B9\u6848B\u811A\u672C");
+            base = b;
+            break;
+          } catch (e) {
+            log("\u65B9\u6848B\u811A\u672C " + b + " \u5931\u8D25 " + e.message);
+          }
+        }
+        if (!vision) throw new Error("\u65B9\u6848B\u811A\u672C\u52A0\u8F7D\u5931\u8D25");
+        const fileset = await withTimeout(vision.FilesetResolver.forVisionTasks(base + "wasm"), 6e4, "\u65B9\u6848B\u8FD0\u884C\u5E93");
+        const model = await fetchModel();
+        lm = await withTimeout(
+          vision.HandLandmarker.createFromOptions(fileset, {
+            baseOptions: { modelAssetBuffer: model, delegate },
+            runningMode: "VIDEO",
+            numHands: 1
+          }),
+          6e4,
+          "\u65B9\u6848B\u6A21\u578B\u542F\u52A8"
+        );
+      },
+      detect(input) {
+        const ts = Math.max(performance.now(), lastTs + 1);
+        lastTs = ts;
+        const r = lm.detectForVideo(input, ts);
+        return Promise.resolve({
+          multiHandLandmarks: r.landmarks || [],
+          multiHandWorldLandmarks: r.worldLandmarks || [],
+          multiHandedness: (r.handedness || []).map((h) => ({ label: h[0] && h[0].categoryName, score: h[0] && h[0].score }))
+        });
+      },
+      close() {
+        try {
+          if (lm) lm.close();
+        } catch (e) {
+        }
+      }
+    };
+  }
+  var engine = null;
+  async function loadEngine(order) {
+    state.modelReady = false;
+    for (const make of order) {
+      const eng = make();
+      const t0 = performance.now();
+      log("\u52A0\u8F7D\u65B9\u6848" + eng.name + "\u2026");
+      setStatus("\u6B63\u5728\u52A0\u8F7D\u8BC6\u522B\u65B9\u6848 " + eng.name + "\uFF08\u7B2C\u4E00\u6B21\u9700\u8981\u4E0B\u8F7D\uFF0C\u7EA6\u5341\u51E0 MB\uFF09\u2026");
+      try {
+        await eng.load();
+        log("\u65B9\u6848" + eng.name + " \u52A0\u8F7D\u5B8C\u6210 " + ((performance.now() - t0) / 1e3).toFixed(1) + "s");
+        if (engine) engine.close();
+        engine = eng;
+        state.engineName = eng.name;
+        state.engineFails = 0;
+        state.engineStart = performance.now();
+        state.firstResult = false;
+        state.modelReady = true;
+        updateLabels();
+        return true;
+      } catch (e) {
+        log("\u65B9\u6848" + eng.name + " \u5931\u8D25\uFF1A" + e.message);
+        eng.close();
       }
     }
-    const buf = new Uint8Array(got);
-    let o = 0;
-    for (const part of parts) {
-      buf.set(part, o);
-      o += part.length;
+    return false;
+  }
+  var params = new URLSearchParams(location.search);
+  var WANT = params.get("engine") === "A" ? "A" : "B";
+  var ORDER_ALL = WANT === "A" ? [() => legacyEngine(LEGACY_BASES[0]), () => legacyEngine(LEGACY_BASES[1])] : [() => tasksEngine("CPU")];
+  function reloadWith(engineName, reason) {
+    const tried = (params.get("tried") || "").split(",").filter(Boolean);
+    if (tried.indexOf(engineName) >= 0) return false;
+    tried.push(WANT);
+    log("\u6362\u65B9\u6848" + engineName + "\uFF1A" + reason);
+    const q = new URLSearchParams({ engine: engineName, auto: "1", tried: tried.join(","), why: "\u65B9\u6848" + WANT + " " + reason, v: "8" });
+    setTimeout(() => location.replace(location.pathname + "?" + q.toString()), 800);
+    return true;
+  }
+  async function engineFailed(msg) {
+    log("\u65B9\u6848" + state.engineName + " \u8BC6\u522B" + msg);
+    state.engineFails = (state.engineFails || 0) + 1;
+    if (state.engineFails < 2 && !/秒/.test(msg)) return;
+    state.modelReady = false;
+    if (!reloadWith(state.engineName === "A" ? "B" : "A", msg)) {
+      state.errText = "\u65B9\u6848" + state.engineName + " " + msg;
+      $("log").style.display = "block";
     }
-    return buf;
   }
   var hand = { label: null, other: 0 };
   function stickyHand(label, score) {
@@ -890,7 +1047,7 @@
     }
     if (now - state.since > 1e3) {
       const sec = (now - state.since) / 1e3;
-      $("fps").textContent = (state.src === "canvas" ? "[\u753B\u5E03] " : "") + Math.round(state.frames / sec) + " \u5E27/\u79D2 \xB7 \u8BC6\u522B " + Math.round(state.detects / sec) + " \u6B21/\u79D2 \xB7 \u8BA4\u51FA " + Math.round(state.hits / sec) + " \xB7 " + Math.round(state.detectMs) + "ms";
+      $("fps").textContent = "\u65B9\u6848" + (state.engineName || "-") + " \xB7 " + Math.round(state.frames / sec) + " \u5E27/\u79D2 \xB7 \u8BC6\u522B " + Math.round(state.detects / sec) + " \u6B21/\u79D2 \xB7 \u8BA4\u51FA " + Math.round(state.hits / sec) + " \xB7 " + Math.round(state.detectMs) + "ms";
       if (state.debug) {
         $("fps").textContent += " \xB7 " + video.videoWidth + "\xD7" + video.videoHeight + " \xB7 " + state.camLabel;
         if (state.roll != null) $("fps").textContent += " \xB7 \u8F6C " + Math.round(state.roll * 180 / Math.PI) + "\xB0";
@@ -903,52 +1060,29 @@
       state.since = now;
     }
   }
-  var srcCanvas = document.createElement("canvas");
-  function detectInput() {
-    if (state.src !== "canvas") return video;
-    const s = Math.min(1, 640 / Math.max(video.videoWidth, video.videoHeight));
-    const w = Math.round(video.videoWidth * s);
-    const h = Math.round(video.videoHeight * s);
-    if (srcCanvas.width !== w || srcCanvas.height !== h) {
-      srcCanvas.width = w;
-      srcCanvas.height = h;
-    }
-    srcCanvas.getContext("2d").drawImage(video, 0, 0, w, h);
-    return srcCanvas;
-  }
-  function detectFailed(msg, src) {
-    log(msg + "\uFF08" + (src === "canvas" ? "\u753B\u5E03" : "\u89C6\u9891") + "\uFF09");
-    if (src !== "canvas") {
-      state.src = "canvas";
-      log("\u6539\u7528\u753B\u5E03\u65B9\u5F0F\u8BC6\u522B");
-    } else {
-      state.errText = msg;
-      $("log").style.display = "block";
-    }
-  }
   async function loop() {
     if (!state.running) return;
     if (video.readyState >= 2) {
       layoutCanvas();
       drawFrame();
-      if (!state.busy && state.modelReady && !state.switching) {
+      if (!state.busy && state.modelReady && !state.switching && engine) {
         state.busy = true;
         const t0 = performance.now();
-        const myRun = state.runId = (state.runId || 0) + 1;
-        const src = state.src;
+        const eng = engine;
+        let done = false;
         const guard = setTimeout(() => {
-          if (state.runId !== myRun) return;
-          detectFailed("\u8BC6\u522B\u8D85\u8FC7 5 \u79D2\u6CA1\u8FD4\u56DE", src);
+          if (done || eng !== engine) return;
           state.busy = false;
-        }, 5e3);
-        Promise.resolve().then(() => {
-          const ts = Math.max(performance.now(), (state.lastTs || 0) + 1);
-          state.lastTs = ts;
-          onResults(toLegacy(landmarker.detectForVideo(detectInput(), ts)));
+          engineFailed("\u8D85\u8FC7 6 \u79D2\u6CA1\u8FD4\u56DE");
+        }, 6e3);
+        Promise.resolve().then(() => eng.detect(video)).then((r) => {
+          if (eng !== engine) return;
+          onResults(r);
           state.detectMs = state.detectMs * 0.8 + (performance.now() - t0) * 0.2;
-        }).catch((e) => detectFailed("\u8BC6\u522B\u51FA\u9519 " + (e && e.message || e), src)).finally(() => {
+        }).catch((e) => eng === engine && engineFailed("\u51FA\u9519 " + (e && e.message || e))).finally(() => {
+          done = true;
           clearTimeout(guard);
-          state.busy = false;
+          if (eng === engine) state.busy = false;
         });
       }
     } else if (performance.now() - state.since > 1e3) {
@@ -1052,6 +1186,7 @@
         state.switching = false;
         setButtons(true);
         $("start").style.display = "none";
+        if (!state.engineStart) state.engineStart = performance.now();
         setStatus(state.modelReady ? "" : "\u6B63\u5728\u52A0\u8F7D\u8BC6\u522B\u6A21\u578B\u2026");
         if (!state.running) {
           state.running = true;
@@ -1071,40 +1206,29 @@
     setStatus("\u6444\u50CF\u5934\u6253\u4E0D\u5F00\uFF1A" + (lastErr && lastErr.name) + "\u3002\u53EF\u4EE5\u518D\u70B9\u4E00\u6B21\u5207\u6362\uFF0C\u6216\u70B9\u53F3\u4E0A\u89D2\u300C\u2026\u300D\u9009\u300C\u5728\u6D4F\u89C8\u5668\u6253\u5F00\u300D", true);
   }
   function setButtons(on) {
-    ["camBtn", "lensBtn"].forEach((id) => $(id).disabled = !on);
-  }
-  async function loadModel() {
-    const t0 = performance.now();
-    log("\u5F00\u59CB\u52A0\u8F7D\u8BC6\u522B\u6A21\u578B");
-    try {
-      await fetchWithProgress("./tasks/wasm/vision_wasm_internal.wasm", "\u8BC6\u522B\u7A0B\u5E8F\uFF08\u7EA6 14MB\uFF09");
-      log("\u8BC6\u522B\u7A0B\u5E8F\u4E0B\u8F7D\u5B8C\u6210 " + ((performance.now() - t0) / 1e3).toFixed(1) + "s");
-      if (!modelBuf) modelBuf = await fetchWithProgress("./models/hand_landmarker.task", "\u624B\u90E8\u6A21\u578B\uFF08\u7EA6 8MB\uFF09");
-      log("\u624B\u90E8\u6A21\u578B\u4E0B\u8F7D\u5B8C\u6210 " + ((performance.now() - t0) / 1e3).toFixed(1) + "s");
-      setStatus("\u6B63\u5728\u542F\u52A8\u8BC6\u522B\u2026");
-      await createLandmarker(state.delegate);
-      state.modelReady = true;
-      log("\u6A21\u578B\u52A0\u8F7D\u5B8C\u6210 " + ((performance.now() - t0) / 1e3).toFixed(1) + "s");
-    } catch (e) {
-      log("\u6A21\u578B\u52A0\u8F7D\u5931\u8D25 " + (e && e.message));
-      setStatus("\u8BC6\u522B\u6A21\u578B\u52A0\u8F7D\u5931\u8D25\uFF1A" + (e && e.message) + "\u3002\u8BF7\u68C0\u67E5\u7F51\u7EDC\u540E\u5237\u65B0", true);
-    }
+    ["camBtn", "lensBtn", "modelBtn"].forEach((id) => $(id).disabled = !on);
   }
   $("start").onclick = async () => {
     $("start").disabled = true;
     $("log").style.display = "block";
     setStatus("\u6B63\u5728\u52A0\u8F7D\u8BC6\u522B\u6A21\u578B\uFF08\u9996\u6B21\u7EA6 8MB\uFF0C\u7F51\u7EDC\u6162\u65F6\u8981\u7B49\u4E00\u4F1A\uFF09\u2026");
     await loadBeadImages();
-    await loadModel();
-    if (!state.modelReady) {
+    if (!await loadEngine(ORDER_ALL)) {
+      if (reloadWith(WANT === "A" ? "B" : "A", "\u52A0\u8F7D\u5931\u8D25")) return;
+      setStatus("\u8BC6\u522B\u65B9\u6848\u90FD\u52A0\u8F7D\u5931\u8D25\uFF0C\u8BF7\u622A\u56FE\u53D1\u7ED9\u5F00\u53D1\uFF0C\u7136\u540E\u5237\u65B0\u518D\u8BD5", true);
       $("start").disabled = false;
       return;
     }
     setStatus("\u6B63\u5728\u6253\u5F00\u6444\u50CF\u5934\u2026");
     await startCamera();
-    setTimeout(() => {
-      if (!state.debug) $("log").style.display = "none";
-    }, 8e3);
+    const hide = setInterval(() => {
+      if (state.firstResult && !state.errText) {
+        clearInterval(hide);
+        setTimeout(() => {
+          if (!state.debug) $("log").style.display = "none";
+        }, 3e3);
+      }
+    }, 500);
   };
   $("lensBtn").onclick = () => {
     if (state.facing === "user") state.facing = "environment";
@@ -1133,19 +1257,9 @@
     $("log").style.display = state.debug ? "block" : "none";
     updateLabels();
   };
-  $("modelBtn").onclick = async () => {
-    if (!state.modelReady) return;
-    state.modelReady = false;
-    const next = state.delegate === "CPU" ? "GPU" : "CPU";
-    log("\u5207\u6362\u5230" + (next === "CPU" ? "CPU" : "\u663E\u5361") + "\u8BA1\u7B97");
-    try {
-      await createLandmarker(next);
-      state.delegate = next;
-    } catch (e) {
-      log("\u5207\u6362\u5931\u8D25 " + e.message);
-    }
-    state.modelReady = true;
-    updateLabels();
+  $("modelBtn").onclick = () => {
+    const q = new URLSearchParams({ engine: state.engineName === "A" ? "B" : "A", auto: "1", v: "8" });
+    location.replace(location.pathname + "?" + q.toString());
   };
   $("wristMinus").onclick = () => {
     state.wristCm = Math.max(13, state.wristCm - 0.5);
@@ -1161,7 +1275,10 @@
   };
   $("shotBox").onclick = () => $("shotBox").style.display = "none";
   window.addEventListener("resize", layoutCanvas);
+  setButtons(false);
   updateLabels();
   setStatus("\u70B9\u4E0B\u9762\u7684\u6309\u94AE\u6253\u5F00\u6444\u50CF\u5934");
   window.__tryon = { state, onResults, drawFrame, layoutCanvas, startCamera };
+  if (params.get("why")) log("\u4E0A\u4E00\u6B21\uFF1A" + params.get("why") + "\uFF0C\u5DF2\u81EA\u52A8\u6362\u65B9\u6848");
+  if (params.get("auto") === "1") setTimeout(() => $("start").click(), 300);
 })();
