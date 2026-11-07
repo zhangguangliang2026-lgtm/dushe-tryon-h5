@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>独奢 · 摄像头检测</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; background:#111; color:#eee; font:14px/1.5 -apple-system,"PingFang SC",sans-serif; padding:12px; }
+  h1 { font-size:17px; margin:4px 0 8px; }
+  .tip { color:#bbb; font-size:13px; margin-bottom:10px; }
+  button { height:44px; padding:0 18px; border:0; border-radius:22px; background:#fff; color:#222; font-size:15px; margin-right:8px; }
+  button:disabled { opacity:.4; }
+  #preview { position:relative; width:100%; aspect-ratio:4/3; background:#000; margin:10px 0; border-radius:8px; overflow:hidden; }
+  #preview video { width:100%; height:100%; object-fit:contain; }
+  #now { position:absolute; left:6px; top:6px; background:rgba(0,0,0,.6); padding:2px 8px; border-radius:8px; font-size:12px; }
+  .item { display:flex; gap:8px; align-items:center; padding:6px 0; border-bottom:1px solid #2a2a2a; font-size:12px; }
+  .item canvas { width:64px; height:48px; background:#000; border-radius:4px; flex:none; }
+  .ok { color:#6d6; } .bad { color:#f77; } .warn { color:#fc6; }
+  pre { white-space:pre-wrap; word-break:break-all; font-size:11px; color:#9fe; background:#000; padding:8px; border-radius:6px; }
+</style>
+</head>
+<body>
+<h1>摄像头检测（约 30 秒）</h1>
+<div class="tip">把手机后面的摄像头对着桌面或自己的手，不要挡住镜头，然后点「开始检测」。检测时会依次打开每个摄像头，画面会切换几次，属于正常。全部完成后截图发给开发，或点「复制结果」。</div>
+<button id="go">开始检测</button><button id="copy" disabled>复制结果</button>
+<div id="preview"><video id="v" playsinline muted autoplay></video><span id="now">未开始</span></div>
+<div id="list"></div>
+<pre id="out"></pre>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var v = $('v');
+  var lines = [];
+  var T0 = Date.now();
+  function out(s) { lines.push(s); $('out').textContent = lines.join('\n'); }
+  function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function withTimeout(p, ms) {
+    return Promise.race([p, new Promise(function (_, rej) { setTimeout(function () { var e = new Error('超过 ' + ms / 1000 + ' 秒没有响应'); e.name = 'Timeout'; rej(e); }, ms); })]);
+  }
+  function stop() {
+    if (v.srcObject) { v.srcObject.getTracks().forEach(function (t) { t.stop(); }); }
+    v.srcObject = null;
+  }
+  // 量 2.5 秒：画面时间有没有走、有多少新帧、亮度和明暗变化（全黑 = 没画面）
+  function measure(thumb) {
+    return new Promise(function (resolve) {
+      var t0 = v.currentTime, frames = 0, start = Date.now();
+      var hasRVFC = typeof v.requestVideoFrameCallback === 'function';
+      if (hasRVFC) { var cb = function () { frames++; if (Date.now() - start < 2500) v.requestVideoFrameCallback(cb); }; v.requestVideoFrameCallback(cb); }
+      setTimeout(function () {
+        var c = thumb, g = c.getContext('2d');
+        c.width = 64; c.height = 48;
+        var mean = -1, sd = -1;
+        try {
+          g.drawImage(v, 0, 0, 64, 48);
+          var d = g.getImageData(0, 0, 64, 48).data, sum = 0, sq = 0, n = 0;
+          for (var i = 0; i < d.length; i += 4) { var y = 0.3 * d[i] + 0.59 * d[i + 1] + 0.11 * d[i + 2]; sum += y; sq += y * y; n++; }
+          mean = sum / n; sd = Math.sqrt(Math.max(0, sq / n - mean * mean));
+        } catch (e) { mean = -2; }
+        resolve({ advance: v.currentTime - t0, frames: hasRVFC ? frames : -1, mean: mean, sd: sd, w: v.videoWidth, h: v.videoHeight, rs: v.readyState });
+      }, 2500);
+    });
+  }
+  function row(name) {
+    var div = document.createElement('div'); div.className = 'item';
+    var c = document.createElement('canvas'); var span = document.createElement('span');
+    span.textContent = name + '：检测中…';
+    div.appendChild(c); div.appendChild(span); $('list').appendChild(div);
+    return { c: c, span: span };
+  }
+  async function tryOne(name, constraints) {
+    var r = row(name);
+    $('now').textContent = '正在检测：' + name;
+    stop();
+    await wait(1000); // 等上一个摄像头放开
+    var res = { name: name };
+    try {
+      var pending = navigator.mediaDevices.getUserMedia({ audio: false, video: constraints });
+      var timedOut = false;
+      pending.then(function (s) { if (timedOut) s.getTracks().forEach(function (t) { t.stop(); }); }, function () {});
+      var stream = await withTimeout(pending, 6000).catch(function (e) { if (e.name === 'Timeout') timedOut = true; throw e; });
+      var tr = stream.getVideoTracks()[0];
+      var st = tr && tr.getSettings ? tr.getSettings() : {};
+      res.label = tr ? tr.label : '';
+      res.facing = st.facingMode || '';
+      v.srcObject = stream;
+      try { await withTimeout(v.play(), 3000); } catch (e) { res.playErr = e.name; }
+      var m = await measure(r.c);
+      Object.assign(res, m);
+      var black = m.mean >= 0 && m.mean < 8 && m.sd < 4;
+      var moving = m.advance > 0.3 || m.frames > 3;
+      res.verdict = !m.w ? '无画面尺寸' : black ? '黑屏' : !moving ? '画面不动' : '正常';
+    } catch (e) {
+      res.err = (e.name || '') + ' ' + (e.message || '');
+      res.verdict = '打不开';
+    }
+    var cls = res.verdict === '正常' ? 'ok' : res.verdict === '打不开' ? 'bad' : 'warn';
+    r.span.innerHTML = '<b class="' + cls + '">' + res.verdict + '</b> ' + name + '<br>' +
+      (res.err ? res.err : (res.label || '') + ' ' + res.w + '×' + res.h + ' 走了' + (res.advance || 0).toFixed(1) + 's 帧' + res.frames + ' 亮度' + Math.round(res.mean) + '/' + Math.round(res.sd) + (res.playErr ? ' 播放:' + res.playErr : ''));
+    out([res.verdict, name, res.err || '', res.label || '', res.facing || '', (res.w || 0) + 'x' + (res.h || 0), 'adv=' + (res.advance || 0).toFixed(2), 'fr=' + (res.frames == null ? '-' : res.frames), (res.mean == null ? '' : 'Y=' + Math.round(res.mean) + '/' + Math.round(res.sd)), res.playErr || ''].join(' | '));
+    return res;
+  }
+  $('go').onclick = async function () {
+    $('go').disabled = true;
+    lines = []; $('list').innerHTML = '';
+    out('UA: ' + navigator.userAgent);
+    out('页面: ' + location.href + ' · ' + new Date().toLocaleString());
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { out('这个浏览器没有 getUserMedia'); $('now').textContent = '这个浏览器不支持摄像头'; return; }
+    var tests = [
+      ['A 默认 video:true', true],
+      ['B 后置 environment', { facingMode: 'environment' }],
+      ['C 后置 environment 640×480', { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } }],
+      ['D 后置 exact environment', { facingMode: { exact: 'environment' } }],
+      ['E 前置 user', { facingMode: 'user' }],
+    ];
+    for (var i = 0; i < tests.length; i++) await tryOne(tests[i][0], tests[i][1]);
+    // 有了权限以后才能拿到每个摄像头的名字
+    var cams = [];
+    try { cams = (await navigator.mediaDevices.enumerateDevices()).filter(function (d) { return d.kind === 'videoinput'; }); } catch (e) { out('列摄像头失败 ' + e.name); }
+    out('摄像头数量: ' + cams.length + ' → ' + cams.map(function (d, i) { return i + ':' + (d.label || '(无名)'); }).join(' ; '));
+    for (var j = 0; j < cams.length && j < 6; j++) {
+      if (!cams[j].deviceId) continue;
+      await tryOne('F' + j + ' ' + (cams[j].label || '摄像头' + j), { deviceId: { exact: cams[j].deviceId } });
+    }
+    stop();
+    out('完成，用时 ' + Math.round((Date.now() - T0) / 1000) + ' 秒');
+    $('now').textContent = '检测完成，请截图（可以往下滑截两张）或点「复制结果」';
+    $('go').disabled = false; $('copy').disabled = false;
+  };
+  $('copy').onclick = function () {
+    var text = lines.join('\n');
+    var done = function () { $('copy').textContent = '已复制'; };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, fallback); else fallback();
+    function fallback() { var t = document.createElement('textarea'); t.value = text; document.body.appendChild(t); t.select(); try { document.execCommand('copy'); done(); } catch (e) { $('copy').textContent = '复制失败，请截图'; } document.body.removeChild(t); }
+  };
+})();
+</script>
+</body>
+</html>
