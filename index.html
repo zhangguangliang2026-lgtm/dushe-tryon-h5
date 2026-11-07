@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>独奢 · 手链试戴测试</title>
+<style>
+  :root { --ink:#2b2826; --pearl:#f6f4f1; --gold:#b8976a; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin:0; height:100%; background:#111; color:#fff; font-family:-apple-system,"PingFang SC","Helvetica Neue",sans-serif; }
+  .app { display:flex; flex-direction:column; height:100%; }
+  #viewport { position:relative; flex:1; overflow:hidden; background:#000; }
+  #video { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
+  #stage { position:absolute; }
+  .hud { position:absolute; left:10px; right:10px; top:10px; display:flex; justify-content:space-between; gap:8px; z-index:3; font-size:12px; flex-wrap:wrap; }
+  .pill { background:rgba(0,0,0,.5); padding:4px 10px; border-radius:12px; }
+  .status { position:absolute; left:20px; right:20px; bottom:20px; z-index:3; background:rgba(0,0,0,.6); padding:10px 14px; border-radius:10px; text-align:center; font-size:14px; line-height:1.5; }
+  .status.error { background:rgba(180,88,74,.92); }
+  #start { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); z-index:4; padding:14px 28px; border-radius:28px; border:0; background:#fff; color:var(--ink); font-size:16px; }
+  .bar { padding:10px 12px calc(10px + env(safe-area-inset-bottom)); background:#111; }
+  .row { display:flex; gap:8px; margin-top:8px; }
+  .row button { flex:1; height:40px; border:0; border-radius:20px; background:#2a2a2a; color:#fff; font-size:13px; }
+  .row button.light { background:#fff; color:var(--ink); }
+  .wrist { display:flex; align-items:center; justify-content:space-between; font-size:13px; color:#ccc; }
+  .wrist button { width:36px; height:32px; border-radius:16px; border:0; background:#2a2a2a; color:#fff; font-size:18px; }
+  .note { font-size:11px; color:#777; text-align:center; margin-top:8px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div id="viewport">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="stage"></canvas>
+    <div class="hud"><span class="pill" id="sampleName"></span><span class="pill" id="fps">—</span></div>
+    <div class="status" id="status"></div>
+    <button id="start">打开摄像头开始试戴</button>
+  </div>
+  <div class="bar">
+    <div class="wrist"><span>手围</span><span><button id="wristMinus">−</button> <button id="wristPlus">＋</button></span></div>
+    <div class="row">
+      <button id="nextBtn">换一条</button>
+      <button id="camBtn">切换摄像头</button>
+      <button id="debugBtn">调试点</button>
+    </div>
+    <div class="row">
+      <button id="modelBtn">模型：精简</button>
+      <button id="shotBtn" class="light">拍一张</button>
+    </div>
+    <div class="note">测试版 0.1 · 手部识别：MediaPipe Hands（Google，Apache 2.0），在你的手机本地运行，画面不上传</div>
+  </div>
+</div>
+<script src="./mediapipe/hands.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>
