@@ -40,6 +40,8 @@ const state = {
   frontCams: [],
   modelReady: false,
   switching: false,
+  src: 'video',
+  errText: '',
   fit: 'contain', // contain 显示完整画面 / cover 铺满屏幕
   camLabel: '',
 };
@@ -204,16 +206,42 @@ function drawFrame() {
   if (now - state.since > 1000) {
     const sec = (now - state.since) / 1000;
     $('fps').textContent =
-      Math.round(state.frames / sec) + ' 帧/秒 · 识别 ' + Math.round(state.detects / sec) + ' 次/秒 · 认出 ' + Math.round(state.hits / sec) + ' · ' + Math.round(state.detectMs) + 'ms';
+      (state.src === 'canvas' ? '[画布] ' : '') + Math.round(state.frames / sec) + ' 帧/秒 · 识别 ' + Math.round(state.detects / sec) + ' 次/秒 · 认出 ' + Math.round(state.hits / sec) + ' · ' + Math.round(state.detectMs) + 'ms';
     if (state.debug) {
       $('fps').textContent += ' · ' + video.videoWidth + '×' + video.videoHeight + ' · ' + state.camLabel;
       if (state.roll != null) $('fps').textContent += ' · 转 ' + Math.round((state.roll * 180) / Math.PI) + '°';
     }
-    setStatus(state.hits ? '' : '张开手掌对准镜头，认出后可以随意转动手腕');
+    if (state.errText) setStatus('识别没跑起来：' + state.errText + '。请截图发给开发', true);
+    else setStatus(state.hits ? '' : '张开手掌对准镜头，认出后可以随意转动手腕');
     state.frames = 0;
     state.detects = 0;
     state.hits = 0;
     state.since = now;
+  }
+}
+
+// 有的手机浏览器不能把摄像头画面直接交给识别（WebGL 读不到视频），这时先画到画布上再交
+const srcCanvas = document.createElement('canvas');
+function detectInput() {
+  if (state.src !== 'canvas') return video;
+  const s = Math.min(1, 640 / Math.max(video.videoWidth, video.videoHeight));
+  const w = Math.round(video.videoWidth * s);
+  const h = Math.round(video.videoHeight * s);
+  if (srcCanvas.width !== w || srcCanvas.height !== h) {
+    srcCanvas.width = w;
+    srcCanvas.height = h;
+  }
+  srcCanvas.getContext('2d').drawImage(video, 0, 0, w, h);
+  return srcCanvas;
+}
+function detectFailed(msg, src) {
+  log(msg + '（' + (src === 'canvas' ? '画布' : '视频') + '）');
+  if (src !== 'canvas') {
+    state.src = 'canvas';
+    log('改用画布方式识别');
+  } else {
+    state.errText = msg;
+    $('log').style.display = 'block';
   }
 }
 
@@ -225,16 +253,19 @@ async function loop() {
     if (!state.busy && state.modelReady && !state.switching) {
       state.busy = true;
       const t0 = performance.now();
-      const guard = setTimeout(() => log('识别超过 5 秒没返回'), 5000);
+      const myRun = (state.runId = (state.runId || 0) + 1);
+      const src = state.src;
+      const guard = setTimeout(() => {
+        if (state.runId !== myRun) return;
+        detectFailed('识别超过 5 秒没返回', src);
+        state.busy = false;
+      }, 5000);
       hands
-        .send({ image: video })
+        .send({ image: detectInput() })
         .then(() => {
           state.detectMs = state.detectMs * 0.8 + (performance.now() - t0) * 0.2;
         })
-        .catch((e) => {
-          log('识别出错 ' + e.message);
-          setStatus('识别出错：' + e.message, true);
-        })
+        .catch((e) => detectFailed('识别出错 ' + ((e && e.message) || e), src))
         .finally(() => {
           clearTimeout(guard);
           state.busy = false;
@@ -450,12 +481,12 @@ $('wristPlus').onclick = () => {
   state.wristCm = Math.min(19, state.wristCm + 0.5);
   updateLabels();
 };
+// 微信里不能直接下载，改为弹出图片，长按保存
 $('shotBtn').onclick = () => {
-  const a = document.createElement('a');
-  a.download = 'dushe-tryon.png';
-  a.href = canvas.toDataURL('image/png');
-  a.click();
+  $('shotImg').src = canvas.toDataURL('image/jpeg', 0.92);
+  $('shotBox').style.display = 'flex';
 };
+$('shotBox').onclick = () => ($('shotBox').style.display = 'none');
 window.addEventListener('resize', layoutCanvas);
 updateLabels();
 setStatus('点下面的按钮打开摄像头');

@@ -690,6 +690,8 @@
     frontCams: [],
     modelReady: false,
     switching: false,
+    src: "video",
+    errText: "",
     fit: "contain",
     // contain 显示完整画面 / cover 铺满屏幕
     camLabel: ""
@@ -837,16 +839,40 @@
     }
     if (now - state.since > 1e3) {
       const sec = (now - state.since) / 1e3;
-      $("fps").textContent = Math.round(state.frames / sec) + " \u5E27/\u79D2 \xB7 \u8BC6\u522B " + Math.round(state.detects / sec) + " \u6B21/\u79D2 \xB7 \u8BA4\u51FA " + Math.round(state.hits / sec) + " \xB7 " + Math.round(state.detectMs) + "ms";
+      $("fps").textContent = (state.src === "canvas" ? "[\u753B\u5E03] " : "") + Math.round(state.frames / sec) + " \u5E27/\u79D2 \xB7 \u8BC6\u522B " + Math.round(state.detects / sec) + " \u6B21/\u79D2 \xB7 \u8BA4\u51FA " + Math.round(state.hits / sec) + " \xB7 " + Math.round(state.detectMs) + "ms";
       if (state.debug) {
         $("fps").textContent += " \xB7 " + video.videoWidth + "\xD7" + video.videoHeight + " \xB7 " + state.camLabel;
         if (state.roll != null) $("fps").textContent += " \xB7 \u8F6C " + Math.round(state.roll * 180 / Math.PI) + "\xB0";
       }
-      setStatus(state.hits ? "" : "\u5F20\u5F00\u624B\u638C\u5BF9\u51C6\u955C\u5934\uFF0C\u8BA4\u51FA\u540E\u53EF\u4EE5\u968F\u610F\u8F6C\u52A8\u624B\u8155");
+      if (state.errText) setStatus("\u8BC6\u522B\u6CA1\u8DD1\u8D77\u6765\uFF1A" + state.errText + "\u3002\u8BF7\u622A\u56FE\u53D1\u7ED9\u5F00\u53D1", true);
+      else setStatus(state.hits ? "" : "\u5F20\u5F00\u624B\u638C\u5BF9\u51C6\u955C\u5934\uFF0C\u8BA4\u51FA\u540E\u53EF\u4EE5\u968F\u610F\u8F6C\u52A8\u624B\u8155");
       state.frames = 0;
       state.detects = 0;
       state.hits = 0;
       state.since = now;
+    }
+  }
+  var srcCanvas = document.createElement("canvas");
+  function detectInput() {
+    if (state.src !== "canvas") return video;
+    const s = Math.min(1, 640 / Math.max(video.videoWidth, video.videoHeight));
+    const w = Math.round(video.videoWidth * s);
+    const h = Math.round(video.videoHeight * s);
+    if (srcCanvas.width !== w || srcCanvas.height !== h) {
+      srcCanvas.width = w;
+      srcCanvas.height = h;
+    }
+    srcCanvas.getContext("2d").drawImage(video, 0, 0, w, h);
+    return srcCanvas;
+  }
+  function detectFailed(msg, src) {
+    log(msg + "\uFF08" + (src === "canvas" ? "\u753B\u5E03" : "\u89C6\u9891") + "\uFF09");
+    if (src !== "canvas") {
+      state.src = "canvas";
+      log("\u6539\u7528\u753B\u5E03\u65B9\u5F0F\u8BC6\u522B");
+    } else {
+      state.errText = msg;
+      $("log").style.display = "block";
     }
   }
   async function loop() {
@@ -857,13 +883,16 @@
       if (!state.busy && state.modelReady && !state.switching) {
         state.busy = true;
         const t0 = performance.now();
-        const guard = setTimeout(() => log("\u8BC6\u522B\u8D85\u8FC7 5 \u79D2\u6CA1\u8FD4\u56DE"), 5e3);
-        hands.send({ image: video }).then(() => {
+        const myRun = state.runId = (state.runId || 0) + 1;
+        const src = state.src;
+        const guard = setTimeout(() => {
+          if (state.runId !== myRun) return;
+          detectFailed("\u8BC6\u522B\u8D85\u8FC7 5 \u79D2\u6CA1\u8FD4\u56DE", src);
+          state.busy = false;
+        }, 5e3);
+        hands.send({ image: detectInput() }).then(() => {
           state.detectMs = state.detectMs * 0.8 + (performance.now() - t0) * 0.2;
-        }).catch((e) => {
-          log("\u8BC6\u522B\u51FA\u9519 " + e.message);
-          setStatus("\u8BC6\u522B\u51FA\u9519\uFF1A" + e.message, true);
-        }).finally(() => {
+        }).catch((e) => detectFailed("\u8BC6\u522B\u51FA\u9519 " + (e && e.message || e), src)).finally(() => {
           clearTimeout(guard);
           state.busy = false;
         });
@@ -1060,11 +1089,10 @@
     updateLabels();
   };
   $("shotBtn").onclick = () => {
-    const a = document.createElement("a");
-    a.download = "dushe-tryon.png";
-    a.href = canvas.toDataURL("image/png");
-    a.click();
+    $("shotImg").src = canvas.toDataURL("image/jpeg", 0.92);
+    $("shotBox").style.display = "flex";
   };
+  $("shotBox").onclick = () => $("shotBox").style.display = "none";
   window.addEventListener("resize", layoutCanvas);
   updateLabels();
   setStatus("\u70B9\u4E0B\u9762\u7684\u6309\u94AE\u6253\u5F00\u6444\u50CF\u5934");

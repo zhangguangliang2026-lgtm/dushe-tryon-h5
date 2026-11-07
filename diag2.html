@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>独奢 · 识别检测</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; background:#111; color:#eee; font:14px/1.5 -apple-system,"PingFang SC",sans-serif; padding:12px; }
+  h1 { font-size:17px; margin:4px 0 8px; }
+  .tip { color:#bbb; font-size:13px; margin-bottom:10px; }
+  button { height:44px; padding:0 18px; border:0; border-radius:22px; background:#fff; color:#222; font-size:15px; margin-right:8px; }
+  button:disabled { opacity:.4; }
+  #preview { position:relative; width:100%; aspect-ratio:3/4; max-height:50vh; background:#000; margin:10px 0; border-radius:8px; overflow:hidden; }
+  #preview video { width:100%; height:100%; object-fit:contain; }
+  #now { position:absolute; left:6px; top:6px; background:rgba(0,0,0,.6); padding:2px 8px; border-radius:8px; font-size:12px; }
+  pre { white-space:pre-wrap; word-break:break-all; font-size:12px; color:#9fe; background:#000; padding:8px; border-radius:6px; }
+  .ok { color:#6d6; } .bad { color:#f77; }
+</style>
+</head>
+<body>
+<h1>手部识别检测（约 30 秒）</h1>
+<div class="tip">点「开始检测」后，把手机后置摄像头对着自己张开的手掌（手腕也拍进去），保持不动，直到显示“检测完成”。然后截图或点「复制结果」发给开发。</div>
+<button id="go">开始检测</button><button id="copy" disabled>复制结果</button>
+<div id="preview"><video id="v" playsinline muted autoplay></video><span id="now">未开始</span></div>
+<pre id="out"></pre>
+<script src="./mediapipe/hands.js"></script>
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var v = $('v'), lines = [], T0 = Date.now();
+  function out(s) { lines.push(s); $('out').textContent = lines.join('\n'); }
+  function sec() { return ((Date.now() - T0) / 1000).toFixed(1) + 's '; }
+  function wait(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  function withTimeout(p, ms, what) {
+    return Promise.race([p, new Promise(function (_, rej) { setTimeout(function () { var e = new Error((what || '') + '超过 ' + ms / 1000 + ' 秒没有返回'); e.name = 'Timeout'; rej(e); }, ms); })]);
+  }
+  function camNo(d) { var m = /camera\s*(\d+)/i.exec(d.label || ''); return m ? +m[1] : 99; }
+
+  function glInfo() {
+    try {
+      var c = document.createElement('canvas');
+      var gl = c.getContext('webgl2');
+      var ver = gl ? 'WebGL2' : (c.getContext('webgl') ? '只有 WebGL1' : '没有 WebGL');
+      var r = '';
+      var g = gl || c.getContext('webgl');
+      if (g) { var ext = g.getExtension('WEBGL_debug_renderer_info'); r = ext ? g.getParameter(ext.UNMASKED_RENDERER_WEBGL) : g.getParameter(g.RENDERER); }
+      return ver + ' · ' + r;
+    } catch (e) { return 'WebGL 检查出错 ' + e.message; }
+  }
+  function simd() {
+    try { return WebAssembly.validate(new Uint8Array([0,97,115,109,1,0,0,0,1,5,1,96,0,1,123,3,2,1,0,10,10,1,8,0,65,0,253,15,253,98,11])) ? '支持' : '不支持'; } catch (e) { return '检查出错'; }
+  }
+
+  var last = null;
+  async function sendN(hands, name, makeInput, n) {
+    var found = 0, ok = 0, ms = [], err = '';
+    for (var i = 0; i < n; i++) {
+      last = null;
+      var t = performance.now();
+      try {
+        await withTimeout(hands.send({ image: makeInput() }), 8000, '识别');
+        ok++; ms.push(Math.round(performance.now() - t));
+        if (last && last.multiHandLandmarks && last.multiHandLandmarks.length) found++;
+      } catch (e) { err = (e.name || '') + ' ' + (e.message || e); break; }
+    }
+    var good = ok === n && found > 0;
+    out((good ? '✅ ' : '❌ ') + name + '：完成 ' + ok + '/' + n + '，认出手 ' + found + ' 次，耗时 ' + (ms.join(',') || '-') + 'ms' + (err ? '，出错：' + err : ''));
+    return { ok: ok, found: found, err: err };
+  }
+
+  $('go').onclick = async function () {
+    $('go').disabled = true; lines = []; T0 = Date.now();
+    out('UA: ' + navigator.userAgent);
+    out('图形: ' + glInfo() + ' · wasm SIMD ' + simd() + ' · 屏幕 ' + screen.width + '×' + screen.height + ' dpr ' + devicePixelRatio);
+    // 1. 加载模型
+    $('now').textContent = '加载识别模型…';
+    var hands;
+    try {
+      hands = new Hands({ locateFile: function (f) { out(sec() + '下载 ' + f); return './mediapipe/' + f; } });
+      hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+      hands.onResults(function (r) { last = r; });
+      await withTimeout(hands.initialize(), 60000, '模型加载');
+      out(sec() + '✅ 模型加载完成');
+    } catch (e) { out(sec() + '❌ 模型加载失败：' + e.name + ' ' + e.message); $('go').disabled = false; return; }
+    // 2. 用一张固定的手部照片测：排除摄像头因素
+    $('now').textContent = '用照片测识别…';
+    var img = new Image(); img.src = './diag-hand.jpg';
+    try { await withTimeout(img.decode ? img.decode() : new Promise(function (r) { img.onload = r; }), 10000, '照片加载'); } catch (e) { out('照片加载失败 ' + e.message); }
+    await sendN(hands, 'A 固定照片', function () { return img; }, 3);
+    // 3. 打开后置主摄
+    $('now').textContent = '打开摄像头…';
+    try {
+      var cams = (await navigator.mediaDevices.enumerateDevices()).filter(function (d) { return d.kind === 'videoinput' && d.label && !/front/i.test(d.label); });
+      cams.sort(function (a, b) { return camNo(a) - camNo(b); });
+      var c = cams[0] ? { deviceId: { exact: cams[0].deviceId } } : { facingMode: 'environment' };
+      var stream = await withTimeout(navigator.mediaDevices.getUserMedia({ audio: false, video: c }), 8000, '打开摄像头');
+      v.srcObject = stream; await v.play();
+      out(sec() + '✅ 摄像头 ' + stream.getVideoTracks()[0].label + ' ' + v.videoWidth + '×' + v.videoHeight);
+    } catch (e) { out(sec() + '❌ 摄像头：' + e.name + ' ' + e.message); $('go').disabled = false; return; }
+    $('now').textContent = '对准手掌，别动…';
+    await wait(2500);
+    // 4. 直接把摄像头画面交给识别
+    await sendN(hands, 'B 摄像头画面(video)', function () { return v; }, 5);
+    // 5. 先画到画布再交给识别
+    var cv = document.createElement('canvas');
+    cv.width = v.videoWidth; cv.height = v.videoHeight;
+    var g = cv.getContext('2d');
+    await sendN(hands, 'C 摄像头画面(canvas)', function () { g.drawImage(v, 0, 0, cv.width, cv.height); return cv; }, 5);
+    // 6. 缩小的画布
+    var cs = document.createElement('canvas');
+    var s = 320 / Math.max(v.videoWidth, v.videoHeight);
+    cs.width = Math.round(v.videoWidth * s); cs.height = Math.round(v.videoHeight * s);
+    var gs = cs.getContext('2d');
+    await sendN(hands, 'D 缩小画布(320)', function () { gs.drawImage(v, 0, 0, cs.width, cs.height); return cs; }, 5);
+    v.srcObject.getTracks().forEach(function (t) { t.stop(); });
+    out(sec() + '完成');
+    $('now').textContent = '检测完成，请截图或点「复制结果」';
+    $('go').disabled = false; $('copy').disabled = false;
+  };
+  $('copy').onclick = function () {
+    var text = lines.join('\n');
+    var done = function () { $('copy').textContent = '已复制'; };
+    if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, fallback); else fallback();
+    function fallback() { var t = document.createElement('textarea'); t.value = text; document.body.appendChild(t); t.select(); try { document.execCommand('copy'); done(); } catch (e) { $('copy').textContent = '复制失败，请截图'; } document.body.removeChild(t); }
+  };
+})();
+</script>
+</body>
+</html>

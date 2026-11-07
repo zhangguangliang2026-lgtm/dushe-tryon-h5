@@ -26,9 +26,12 @@
   .wrist { display:flex; align-items:center; justify-content:space-between; font-size:13px; color:#ccc; }
   .wrist button { width:36px; height:32px; border-radius:16px; border:0; background:#2a2a2a; color:#fff; font-size:18px; }
   .note { font-size:11px; color:#777; text-align:center; margin-top:8px; }
+  #shotBox { display:none; position:fixed; inset:0; z-index:9; background:rgba(0,0,0,.85); flex-direction:column; align-items:center; justify-content:center; gap:10px; }
+  #shotBox img { max-width:92%; max-height:80%; border-radius:8px; }
 </style>
 </head>
 <body>
+<div id="shotBox"><img id="shotImg" alt=""><div style="font-size:14px">长按图片保存，点空白处关闭</div></div>
 <div class="app">
   <div id="viewport">
     <video id="video" playsinline muted autoplay></video>
@@ -51,10 +54,10 @@
       <button id="modelBtn">模型：精简</button>
       <button id="shotBtn" class="light">拍一张</button>
     </div>
-    <div class="note">测试版 0.5 · 手部识别：MediaPipe Hands（Google，Apache 2.0），在你的手机本地运行，画面不上传</div>
+    <div class="note">测试版 0.6 · 手部识别：MediaPipe Hands（Google，Apache 2.0），在你的手机本地运行，画面不上传</div>
   </div>
 </div>
 <script src="./mediapipe/hands.js"></script>
-<script src="./app.js?v=5"></script>
+<script src="./app.js?v=6"></script>
 </body>
 </html>
