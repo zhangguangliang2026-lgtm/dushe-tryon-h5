@@ -21,7 +21,8 @@ const PITCH_GAIN = 0.5; // 手腕弯曲时手掌方向不等于前臂方向，�
 const $ = (id) => document.getElementById(id);
 const state = {
   sample: 0,
-  wristCm: 15.5,
+  wristCm: SAMPLES[0].wristCm || 15.5,
+  wristTouched: false,
   facing: 'environment',
   model: 0, // 0 精简 / 1 完整
   debug: false,
@@ -315,7 +316,7 @@ function reloadWith(engineName, reason) {
   if (tried.indexOf(engineName) >= 0) return false;
   tried.push(WANT);
   log('换方案' + engineName + '：' + reason);
-  const q = new URLSearchParams({ engine: engineName, auto: '1', tried: tried.join(','), why: '方案' + WANT + ' ' + reason, v: '9' });
+  const q = new URLSearchParams({ engine: engineName, auto: '1', tried: tried.join(','), why: '方案' + WANT + ' ' + reason, v: '10' });
   setTimeout(() => location.replace(location.pathname + '?' + q.toString()), 800);
   return true;
 }
@@ -733,6 +734,7 @@ function setButtons(on) {
 // ---------- 按钮 ----------
 $('start').onclick = async () => {
   $('start').disabled = true;
+  $('start').style.display = 'none'; // 点了就收起，不要盖在摄像头画面上
   $('log').style.display = 'block';
   setStatus('正在加载识别模型（首次约 8MB，网络慢时要等一会）…');
   await loadBeadImages();
@@ -740,6 +742,7 @@ $('start').onclick = async () => {
     if (reloadWith(WANT === 'A' ? 'B' : 'A', '加载失败')) return;
     setStatus('识别方案都加载失败，请截图发给开发，然后刷新再试', true);
     $('start').disabled = false;
+    $('start').style.display = '';
     return;
   }
   setStatus('正在打开摄像头…');
@@ -764,6 +767,8 @@ $('lensBtn').onclick = () => {
 };
 $('nextBtn').onclick = () => {
   state.sample = (state.sample + 1) % SAMPLES.length;
+  // 没手动调过手围时，男款按 17cm、女款按 15.5cm
+  if (!state.wristTouched) state.wristCm = SAMPLES[state.sample].wristCm || 15.5;
   updateLabels();
 };
 $('camBtn').onclick = () => {
@@ -783,15 +788,17 @@ $('debugBtn').onclick = () => {
   updateLabels();
 };
 $('modelBtn').onclick = () => {
-  const q = new URLSearchParams({ engine: state.engineName === 'A' ? 'B' : 'A', auto: '1', v: '9' });
+  const q = new URLSearchParams({ engine: state.engineName === 'A' ? 'B' : 'A', auto: '1', v: '10' });
   location.replace(location.pathname + '?' + q.toString());
 };
 $('wristMinus').onclick = () => {
   state.wristCm = Math.max(13, state.wristCm - 0.5);
+  state.wristTouched = true;
   updateLabels();
 };
 $('wristPlus').onclick = () => {
-  state.wristCm = Math.min(19, state.wristCm + 0.5);
+  state.wristCm = Math.min(21, state.wristCm + 0.5);
+  state.wristTouched = true;
   updateLabels();
 };
 // 微信里不能直接下载，改为弹出图片，长按保存

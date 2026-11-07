@@ -44,6 +44,14 @@ function seq(list) {
 
 const SAMPLES = [
   {
+    id: 'tiger14',
+    title: '虎眼石 14mm',
+    note: '男款 · 全虎眼石 14mm',
+    wristCm: 17, // 男生常见手围
+    // 珠子数量会按手围自动补齐：17cm 手围约 13 颗
+    beads: seq(['tiger-eye-14', 'tiger-eye-14', 'tiger-eye-14', 'tiger-eye-14', 'tiger-eye-14', 'tiger-eye-14', 'tiger-eye-14', 'tiger-eye-14', 'tiger-eye-14', 'tiger-eye-14', 'tiger-eye-14', 'tiger-eye-14', 'tiger-eye-14']),
+  },
+  {
     id: 'cool',
     title: '清透月光',
     note: '月光石 · 海蓝宝 · 白水晶',
@@ -81,6 +89,7 @@ const SAMPLES = [
     id: 'men',
     title: '男款虎眼',
     note: '虎眼石 · 黑曜石 12mm',
+    wristCm: 17,
     beads: seq(['tiger-eye-14', 'obsidian-12', 'tiger-eye-12', 'obsidian-12', 'lapis-12', 'obsidian-12', 'tiger-eye-12', 'obsidian-12']),
   },
 ];

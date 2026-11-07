@@ -352,6 +352,11 @@
         ctx2.save();
         ctx2.translate(bead.x, bead.y);
         ctx2.rotate(bead.angle);
+        if (bead.key === "tiger-eye") {
+          const k = Math.sin((bead.index + 1) * 12.9898) * 43758.5453;
+          ctx2.rotate((k - Math.floor(k) - 0.5) * 2.2);
+          if (bead.index % 2) ctx2.scale(-1, 1);
+        }
         if (image) {
           ctx2.drawImage(image, -r, -r, r * 2, r * 2);
         } else {
@@ -477,6 +482,15 @@
       }
       var SAMPLES2 = [
         {
+          id: "tiger14",
+          title: "\u864E\u773C\u77F3 14mm",
+          note: "\u7537\u6B3E \xB7 \u5168\u864E\u773C\u77F3 14mm",
+          wristCm: 17,
+          // 男生常见手围
+          // 珠子数量会按手围自动补齐：17cm 手围约 13 颗
+          beads: seq(["tiger-eye-14", "tiger-eye-14", "tiger-eye-14", "tiger-eye-14", "tiger-eye-14", "tiger-eye-14", "tiger-eye-14", "tiger-eye-14", "tiger-eye-14", "tiger-eye-14", "tiger-eye-14", "tiger-eye-14", "tiger-eye-14"])
+        },
+        {
           id: "cool",
           title: "\u6E05\u900F\u6708\u5149",
           note: "\u6708\u5149\u77F3 \xB7 \u6D77\u84DD\u5B9D \xB7 \u767D\u6C34\u6676",
@@ -562,6 +576,7 @@
           id: "men",
           title: "\u7537\u6B3E\u864E\u773C",
           note: "\u864E\u773C\u77F3 \xB7 \u9ED1\u66DC\u77F3 12mm",
+          wristCm: 17,
           beads: seq(["tiger-eye-14", "obsidian-12", "tiger-eye-12", "obsidian-12", "lapis-12", "obsidian-12", "tiger-eye-12", "obsidian-12"])
         }
       ];
@@ -755,7 +770,8 @@
   var $ = (id) => document.getElementById(id);
   var state = {
     sample: 0,
-    wristCm: 15.5,
+    wristCm: SAMPLES[0].wristCm || 15.5,
+    wristTouched: false,
     facing: "environment",
     model: 0,
     // 0 精简 / 1 完整
@@ -1027,7 +1043,7 @@
     if (tried.indexOf(engineName) >= 0) return false;
     tried.push(WANT);
     log("\u6362\u65B9\u6848" + engineName + "\uFF1A" + reason);
-    const q = new URLSearchParams({ engine: engineName, auto: "1", tried: tried.join(","), why: "\u65B9\u6848" + WANT + " " + reason, v: "9" });
+    const q = new URLSearchParams({ engine: engineName, auto: "1", tried: tried.join(","), why: "\u65B9\u6848" + WANT + " " + reason, v: "10" });
     setTimeout(() => location.replace(location.pathname + "?" + q.toString()), 800);
     return true;
   }
@@ -1400,6 +1416,7 @@
   }
   $("start").onclick = async () => {
     $("start").disabled = true;
+    $("start").style.display = "none";
     $("log").style.display = "block";
     setStatus("\u6B63\u5728\u52A0\u8F7D\u8BC6\u522B\u6A21\u578B\uFF08\u9996\u6B21\u7EA6 8MB\uFF0C\u7F51\u7EDC\u6162\u65F6\u8981\u7B49\u4E00\u4F1A\uFF09\u2026");
     await loadBeadImages();
@@ -1407,6 +1424,7 @@
       if (reloadWith(WANT === "A" ? "B" : "A", "\u52A0\u8F7D\u5931\u8D25")) return;
       setStatus("\u8BC6\u522B\u65B9\u6848\u90FD\u52A0\u8F7D\u5931\u8D25\uFF0C\u8BF7\u622A\u56FE\u53D1\u7ED9\u5F00\u53D1\uFF0C\u7136\u540E\u5237\u65B0\u518D\u8BD5", true);
       $("start").disabled = false;
+      $("start").style.display = "";
       return;
     }
     setStatus("\u6B63\u5728\u6253\u5F00\u6444\u50CF\u5934\u2026");
@@ -1429,6 +1447,7 @@
   };
   $("nextBtn").onclick = () => {
     state.sample = (state.sample + 1) % SAMPLES.length;
+    if (!state.wristTouched) state.wristCm = SAMPLES[state.sample].wristCm || 15.5;
     updateLabels();
   };
   $("camBtn").onclick = () => {
@@ -1448,15 +1467,17 @@
     updateLabels();
   };
   $("modelBtn").onclick = () => {
-    const q = new URLSearchParams({ engine: state.engineName === "A" ? "B" : "A", auto: "1", v: "9" });
+    const q = new URLSearchParams({ engine: state.engineName === "A" ? "B" : "A", auto: "1", v: "10" });
     location.replace(location.pathname + "?" + q.toString());
   };
   $("wristMinus").onclick = () => {
     state.wristCm = Math.max(13, state.wristCm - 0.5);
+    state.wristTouched = true;
     updateLabels();
   };
   $("wristPlus").onclick = () => {
-    state.wristCm = Math.min(19, state.wristCm + 0.5);
+    state.wristCm = Math.min(21, state.wristCm + 0.5);
+    state.wristTouched = true;
     updateLabels();
   };
   $("shotBtn").onclick = () => {

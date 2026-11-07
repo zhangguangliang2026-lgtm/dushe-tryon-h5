@@ -38,6 +38,12 @@ function drawBead(ctx, image, bead, darken, tint) {
   ctx.save();
   ctx.translate(bead.x, bead.y);
   ctx.rotate(bead.angle);
+  // 虎眼石每颗纹路方向都不一样：按珠子序号固定转一个角度，整串不会像复制出来的条纹
+  if (bead.key === 'tiger-eye') {
+    const k = Math.sin((bead.index + 1) * 12.9898) * 43758.5453;
+    ctx.rotate((k - Math.floor(k) - 0.5) * 2.2);
+    if (bead.index % 2) ctx.scale(-1, 1);
+  }
   if (image) {
     ctx.drawImage(image, -r, -r, r * 2, r * 2);
   } else {
