@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>独奢 · 识别检测 3</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin:0; background:#111; color:#eee; font:14px/1.5 -apple-system,"PingFang SC",sans-serif; padding:12px; }
+  h1 { font-size:17px; margin:4px 0 8px; }
+  .tip { color:#bbb; font-size:13px; margin-bottom:10px; }
+  button { height:44px; padding:0 18px; border:0; border-radius:22px; background:#fff; color:#222; font-size:15px; margin-right:8px; }
+  button:disabled { opacity:.4; }
+  #preview { position:relative; width:100%; height:34vh; background:#000; margin:10px 0; border-radius:8px; overflow:hidden; }
+  #preview video { width:100%; height:100%; object-fit:contain; }
+  #now { position:absolute; left:6px; top:6px; background:rgba(0,0,0,.7); padding:2px 8px; border-radius:8px; font-size:13px; color:#fc6; }
+  pre { white-space:pre-wrap; word-break:break-all; font-size:12px; color:#9fe; background:#000; padding:8px; border-radius:6px; }
+</style>
+</head>
+<body>
+<h1>手部识别检测 3（约 1 分钟）</h1>
+<div class="tip">点「开始检测」，等出现“对准手掌”时，把后置摄像头对着张开的手掌（手腕也拍进去），别动，直到显示“检测完成”。然后点「复制结果」粘贴给开发（或截图）。</div>
+<button id="go">开始检测</button><button id="copy" disabled>复制结果</button>
+<div id="preview"><video id="v" playsinline muted autoplay></video><span id="now">未开始</span></div>
+<pre id="out"></pre>
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const v = $('v');
+let lines = [];
+let T0 = performance.now();
+const sec = () => ((performance.now() - T0) / 1000).toFixed(1) + 's ';
+const out = (s) => { lines.push(s); $('out').textContent = lines.join('\n'); };
+const now = (s) => ($('now').textContent = s);
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+function withTimeout(p, ms, what) {
+  return Promise.race([p, new Promise((_, rej) => setTimeout(() => { const e = new Error(what + '超过 ' + ms / 1000 + ' 秒没有完成'); e.name = 'Timeout'; rej(e); }, ms))]);
+}
+const camNo = (d) => { const m = /camera\s*(\d+)/i.exec(d.label || ''); return m ? +m[1] : 99; };
+
+// 带进度地下载，记录网速
+async function download(url) {
+  const t = performance.now();
+  const res = await fetch(url, { cache: 'force-cache' });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const total = +res.headers.get('content-length') || 0;
+  const reader = res.body.getReader();
+  const parts = [];
+  let got = 0, lastShow = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    parts.push(value); got += value.length;
+    if (performance.now() - lastShow > 300) { lastShow = performance.now(); now('下载 ' + url.split('/').pop() + ' ' + (got / 1048576).toFixed(1) + 'MB'); }
+  }
+  const buf = new Uint8Array(got);
+  let o = 0; for (const p of parts) { buf.set(p, o); o += p.length; }
+  const s = (performance.now() - t) / 1000;
+  out(sec() + '下载 ' + url.split('/').pop() + ' ' + (got / 1048576).toFixed(1) + 'MB，用时 ' + s.toFixed(1) + 's' + (total && total !== got ? '（压缩传输 ' + (total / 1048576).toFixed(1) + 'MB）' : ''));
+  return buf;
+}
+
+async function detectN(name, fn, n) {
+  let ok = 0, found = 0, ms = [], err = '';
+  for (let i = 0; i < n; i++) {
+    const t = performance.now();
+    try {
+      const r = await withTimeout(Promise.resolve().then(fn), 10000, '识别');
+      ok++; ms.push(Math.round(performance.now() - t));
+      if (r && r.landmarks && r.landmarks.length) found++;
+    } catch (e) { err = (e.name || '') + ' ' + (e.message || e); break; }
+    await wait(30);
+  }
+  out(sec() + (ok === n && found ? '✅ ' : '❌ ') + name + '：完成 ' + ok + '/' + n + '，认出手 ' + found + ' 次，耗时 ' + (ms.join(',') || '-') + 'ms' + (err ? '，出错：' + err : ''));
+  return ok === n && found > 0;
+}
+
+$('go').onclick = async () => {
+  $('go').disabled = true; lines = []; T0 = performance.now();
+  out('UA: ' + navigator.userAgent);
+  try {
+    const gl = document.createElement('canvas').getContext('webgl2');
+    const ext = gl && gl.getExtension('WEBGL_debug_renderer_info');
+    out('图形: ' + (gl ? 'WebGL2 ' + (ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : '') : '无 WebGL2') + ' · 核心数 ' + (navigator.hardwareConcurrency || '?'));
+  } catch (e) { out('图形检查出错 ' + e.message); }
+
+  // 1. 下载
+  let model, vision;
+  try {
+    now('下载识别文件…');
+    await download('./tasks/wasm/vision_wasm_internal.js');
+    await download('./tasks/wasm/vision_wasm_internal.wasm');
+    model = await download('./models/hand_landmarker.task');
+    vision = await import('./tasks/vision_bundle.mjs');
+    out(sec() + '✅ 文件下载完成');
+  } catch (e) { out(sec() + '❌ 下载失败：' + e.message); $('go').disabled = false; $('copy').disabled = false; return; }
+
+  const img = new Image(); img.src = './diag-hand.jpg';
+  try { await img.decode(); } catch (e) { out('样张加载失败'); }
+
+  let fileset;
+  try { fileset = await withTimeout(vision.FilesetResolver.forVisionTasks('./tasks/wasm'), 20000, '准备运行库'); }
+  catch (e) { out(sec() + '❌ 运行库：' + e.message); $('go').disabled = false; $('copy').disabled = false; return; }
+
+  // 2. CPU 识别（不走显卡）
+  let cpu = null;
+  try {
+    now('CPU 方式加载模型…');
+    const t = performance.now();
+    cpu = await withTimeout(vision.HandLandmarker.createFromOptions(fileset, { baseOptions: { modelAssetBuffer: model, delegate: 'CPU' }, runningMode: 'IMAGE', numHands: 1 }), 30000, 'CPU 模型加载');
+    out(sec() + '✅ CPU 模型加载 ' + Math.round(performance.now() - t) + 'ms');
+    await detectN('A1 CPU·样张', () => cpu.detect(img), 3);
+  } catch (e) { out(sec() + '❌ CPU 模型：' + e.name + ' ' + e.message); }
+
+  // 3. 打开后置主摄
+  try {
+    now('打开摄像头…');
+    const cams = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'videoinput' && d.label && !/front/i.test(d.label)).sort((a, b) => camNo(a) - camNo(b));
+    const c = cams[0] ? { deviceId: { exact: cams[0].deviceId } } : { facingMode: 'environment' };
+    const stream = await withTimeout(navigator.mediaDevices.getUserMedia({ audio: false, video: c }), 8000, '打开摄像头');
+    v.srcObject = stream; await v.play();
+    out(sec() + '✅ 摄像头 ' + stream.getVideoTracks()[0].label + ' ' + v.videoWidth + '×' + v.videoHeight);
+  } catch (e) { out(sec() + '❌ 摄像头：' + e.name + ' ' + e.message); }
+
+  if (v.srcObject) {
+    now('👉 对准手掌，别动…');
+    await wait(3000);
+    if (cpu) {
+      try {
+        await cpu.setOptions({ runningMode: 'VIDEO' });
+        await detectN('A2 CPU·摄像头', () => cpu.detectForVideo(v, performance.now()), 8);
+      } catch (e) { out(sec() + '❌ CPU 摄像头：' + e.message); }
+    }
+  }
+
+  // 4. 显卡识别（之前卡住的可能就是这里，所以放在最后）
+  try {
+    now('显卡方式加载模型…');
+    const t = performance.now();
+    const gpu = await withTimeout(vision.HandLandmarker.createFromOptions(fileset, { baseOptions: { modelAssetBuffer: model, delegate: 'GPU' }, runningMode: 'IMAGE', numHands: 1 }), 30000, '显卡模型加载');
+    out(sec() + '✅ 显卡模型加载 ' + Math.round(performance.now() - t) + 'ms');
+    await detectN('B1 显卡·样张', () => gpu.detect(img), 3);
+    if (v.srcObject) {
+      now('👉 对准手掌，别动…');
+      await gpu.setOptions({ runningMode: 'VIDEO' });
+      await detectN('B2 显卡·摄像头', () => gpu.detectForVideo(v, performance.now()), 8);
+    }
+  } catch (e) { out(sec() + '❌ 显卡模型：' + e.name + ' ' + e.message); }
+
+  if (v.srcObject) v.srcObject.getTracks().forEach((t) => t.stop());
+  out(sec() + '检测完成');
+  now('检测完成，请点「复制结果」');
+  $('go').disabled = false; $('copy').disabled = false;
+};
+$('copy').onclick = () => {
+  const text = lines.join('\n');
+  const done = () => ($('copy').textContent = '已复制');
+  const fallback = () => { const t = document.createElement('textarea'); t.value = text; document.body.appendChild(t); t.select(); try { document.execCommand('copy'); done(); } catch (e) { $('copy').textContent = '复制失败，请截图'; } t.remove(); };
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(done, fallback); else fallback();
+};
+</script>
+</body>
+</html>

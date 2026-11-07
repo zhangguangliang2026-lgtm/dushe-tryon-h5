@@ -691,6 +691,7 @@
     modelReady: false,
     switching: false,
     src: "video",
+    delegate: "CPU",
     errText: "",
     fit: "contain",
     // contain 显示完整画面 / cover 铺满屏幕
@@ -725,18 +726,68 @@
   }
   function updateLabels() {
     $("sampleName").textContent = SAMPLES[state.sample].title + " \xB7 \u624B\u56F4 " + state.wristCm + "cm";
-    $("modelBtn").textContent = state.model ? "\u6A21\u578B\uFF1A\u5B8C\u6574" : "\u6A21\u578B\uFF1A\u7CBE\u7B80";
+    $("modelBtn").textContent = state.delegate === "CPU" ? "\u8BA1\u7B97\uFF1ACPU" : "\u8BA1\u7B97\uFF1A\u663E\u5361";
     $("debugBtn").textContent = state.debug ? "\u5173\u8C03\u8BD5" : "\u8C03\u8BD5\u70B9";
     $("fitBtn").textContent = state.fit === "cover" ? "\u753B\u9762\uFF1A\u94FA\u6EE1" : "\u753B\u9762\uFF1A\u5B8C\u6574";
     $("camBtn").textContent = state.facing === "user" ? "\u6362\u540E\u7F6E" : "\u6362\u524D\u7F6E";
     const n = (state.backCams || []).length;
     $("lensBtn").textContent = n > 1 && state.facing !== "user" ? "\u955C\u5934 " + (state.backIndex + 1) + "/" + n : "\u6362\u955C\u5934";
   }
-  var hands = null;
-  function createHands() {
-    hands = new window.Hands({ locateFile: (f) => "./mediapipe/" + f });
-    hands.setOptions({ maxNumHands: 1, modelComplexity: state.model, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
-    hands.onResults(onResults);
+  var landmarker = null;
+  var fileset = null;
+  var modelBuf = null;
+  async function createLandmarker(delegate) {
+    const vision = await waitVision();
+    if (!fileset) fileset = await vision.FilesetResolver.forVisionTasks("./tasks/wasm");
+    const lm = await vision.HandLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetBuffer: modelBuf, delegate },
+      runningMode: "VIDEO",
+      numHands: 1,
+      minHandDetectionConfidence: 0.5,
+      minHandPresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5
+    });
+    if (landmarker) landmarker.close();
+    landmarker = lm;
+  }
+  function waitVision() {
+    if (window.__vision) return Promise.resolve(window.__vision);
+    return new Promise((resolve, reject) => {
+      window.addEventListener("vision-ready", () => resolve(window.__vision), { once: true });
+      window.addEventListener("vision-error", () => reject(new Error("\u8BC6\u522B\u7A0B\u5E8F\u52A0\u8F7D\u5931\u8D25")), { once: true });
+    });
+  }
+  function toLegacy(r) {
+    return {
+      multiHandLandmarks: r.landmarks || [],
+      multiHandWorldLandmarks: r.worldLandmarks || [],
+      multiHandedness: (r.handedness || []).map((h) => ({ label: h[0] && h[0].categoryName, score: h[0] && h[0].score }))
+    };
+  }
+  async function fetchWithProgress(url, label) {
+    const res = await fetch(url, { cache: "force-cache" });
+    if (!res.ok) throw new Error(label + " \u4E0B\u8F7D\u5931\u8D25 HTTP " + res.status);
+    const reader = res.body.getReader();
+    const parts = [];
+    let got = 0;
+    let shown = 0;
+    for (; ; ) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parts.push(value);
+      got += value.length;
+      if (performance.now() - shown > 250) {
+        shown = performance.now();
+        setStatus("\u6B63\u5728\u4E0B\u8F7D" + label + " " + (got / 1048576).toFixed(1) + "MB\u2026\uFF08\u53EA\u6709\u7B2C\u4E00\u6B21\u9700\u8981\uFF09");
+      }
+    }
+    const buf = new Uint8Array(got);
+    let o = 0;
+    for (const part of parts) {
+      buf.set(part, o);
+      o += part.length;
+    }
+    return buf;
   }
   var hand = { label: null, other: 0 };
   function stickyHand(label, score) {
@@ -890,7 +941,10 @@
           detectFailed("\u8BC6\u522B\u8D85\u8FC7 5 \u79D2\u6CA1\u8FD4\u56DE", src);
           state.busy = false;
         }, 5e3);
-        hands.send({ image: detectInput() }).then(() => {
+        Promise.resolve().then(() => {
+          const ts = Math.max(performance.now(), (state.lastTs || 0) + 1);
+          state.lastTs = ts;
+          onResults(toLegacy(landmarker.detectForVideo(detectInput(), ts)));
           state.detectMs = state.detectMs * 0.8 + (performance.now() - t0) * 0.2;
         }).catch((e) => detectFailed("\u8BC6\u522B\u51FA\u9519 " + (e && e.message || e), src)).finally(() => {
           clearTimeout(guard);
@@ -1022,9 +1076,13 @@
   async function loadModel() {
     const t0 = performance.now();
     log("\u5F00\u59CB\u52A0\u8F7D\u8BC6\u522B\u6A21\u578B");
-    createHands();
     try {
-      await hands.initialize();
+      await fetchWithProgress("./tasks/wasm/vision_wasm_internal.wasm", "\u8BC6\u522B\u7A0B\u5E8F\uFF08\u7EA6 14MB\uFF09");
+      log("\u8BC6\u522B\u7A0B\u5E8F\u4E0B\u8F7D\u5B8C\u6210 " + ((performance.now() - t0) / 1e3).toFixed(1) + "s");
+      if (!modelBuf) modelBuf = await fetchWithProgress("./models/hand_landmarker.task", "\u624B\u90E8\u6A21\u578B\uFF08\u7EA6 8MB\uFF09");
+      log("\u624B\u90E8\u6A21\u578B\u4E0B\u8F7D\u5B8C\u6210 " + ((performance.now() - t0) / 1e3).toFixed(1) + "s");
+      setStatus("\u6B63\u5728\u542F\u52A8\u8BC6\u522B\u2026");
+      await createLandmarker(state.delegate);
       state.modelReady = true;
       log("\u6A21\u578B\u52A0\u8F7D\u5B8C\u6210 " + ((performance.now() - t0) / 1e3).toFixed(1) + "s");
     } catch (e) {
@@ -1075,9 +1133,18 @@
     $("log").style.display = state.debug ? "block" : "none";
     updateLabels();
   };
-  $("modelBtn").onclick = () => {
-    state.model = state.model ? 0 : 1;
-    if (hands) hands.setOptions({ modelComplexity: state.model });
+  $("modelBtn").onclick = async () => {
+    if (!state.modelReady) return;
+    state.modelReady = false;
+    const next = state.delegate === "CPU" ? "GPU" : "CPU";
+    log("\u5207\u6362\u5230" + (next === "CPU" ? "CPU" : "\u663E\u5361") + "\u8BA1\u7B97");
+    try {
+      await createLandmarker(next);
+      state.delegate = next;
+    } catch (e) {
+      log("\u5207\u6362\u5931\u8D25 " + e.message);
+    }
+    state.modelReady = true;
     updateLabels();
   };
   $("wristMinus").onclick = () => {

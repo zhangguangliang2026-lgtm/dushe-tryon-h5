@@ -41,6 +41,7 @@ const state = {
   modelReady: false,
   switching: false,
   src: 'video',
+  delegate: 'CPU',
   errText: '',
   fit: 'contain', // contain 显示完整画面 / cover 铺满屏幕
   camLabel: '',
@@ -79,7 +80,7 @@ function setStatus(text, isError) {
 
 function updateLabels() {
   $('sampleName').textContent = SAMPLES[state.sample].title + ' · 手围 ' + state.wristCm + 'cm';
-  $('modelBtn').textContent = state.model ? '模型：完整' : '模型：精简';
+  $('modelBtn').textContent = state.delegate === 'CPU' ? '计算：CPU' : '计算：显卡';
   $('debugBtn').textContent = state.debug ? '关调试' : '调试点';
   $('fitBtn').textContent = state.fit === 'cover' ? '画面：铺满' : '画面：完整';
   $('camBtn').textContent = state.facing === 'user' ? '换后置' : '换前置';
@@ -88,11 +89,64 @@ function updateLabels() {
 }
 
 // ---------- 识别 ----------
-let hands = null;
-function createHands() {
-  hands = new window.Hands({ locateFile: (f) => './mediapipe/' + f });
-  hands.setOptions({ maxNumHands: 1, modelComplexity: state.model, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
-  hands.onResults(onResults);
+// 识别引擎：MediaPipe Tasks HandLandmarker。默认用 CPU 计算（华为麒麟手机上旧版用显卡计算会卡死）
+let landmarker = null;
+let fileset = null;
+let modelBuf = null;
+async function createLandmarker(delegate) {
+  const vision = await waitVision();
+  if (!fileset) fileset = await vision.FilesetResolver.forVisionTasks('./tasks/wasm');
+  const lm = await vision.HandLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetBuffer: modelBuf, delegate },
+    runningMode: 'VIDEO',
+    numHands: 1,
+    minHandDetectionConfidence: 0.5,
+    minHandPresenceConfidence: 0.5,
+    minTrackingConfidence: 0.5,
+  });
+  if (landmarker) landmarker.close();
+  landmarker = lm;
+}
+function waitVision() {
+  if (window.__vision) return Promise.resolve(window.__vision);
+  return new Promise((resolve, reject) => {
+    window.addEventListener('vision-ready', () => resolve(window.__vision), { once: true });
+    window.addEventListener('vision-error', () => reject(new Error('识别程序加载失败')), { once: true });
+  });
+}
+// 新引擎的结果换成旧格式，后面的代码不用改
+function toLegacy(r) {
+  return {
+    multiHandLandmarks: r.landmarks || [],
+    multiHandWorldLandmarks: r.worldLandmarks || [],
+    multiHandedness: (r.handedness || []).map((h) => ({ label: h[0] && h[0].categoryName, score: h[0] && h[0].score })),
+  };
+}
+// 带进度下载
+async function fetchWithProgress(url, label) {
+  const res = await fetch(url, { cache: 'force-cache' });
+  if (!res.ok) throw new Error(label + ' 下载失败 HTTP ' + res.status);
+  const reader = res.body.getReader();
+  const parts = [];
+  let got = 0;
+  let shown = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    parts.push(value);
+    got += value.length;
+    if (performance.now() - shown > 250) {
+      shown = performance.now();
+      setStatus('正在下载' + label + ' ' + (got / 1048576).toFixed(1) + 'MB…（只有第一次需要）');
+    }
+  }
+  const buf = new Uint8Array(got);
+  let o = 0;
+  for (const part of parts) {
+    buf.set(part, o);
+    o += part.length;
+  }
+  return buf;
 }
 
 // 左右手判断偶尔会在两帧之间跳变，跳一次手链就会转半圈，所以要连续多帧都变了才认
@@ -260,9 +314,11 @@ async function loop() {
         detectFailed('识别超过 5 秒没返回', src);
         state.busy = false;
       }, 5000);
-      hands
-        .send({ image: detectInput() })
+      Promise.resolve()
         .then(() => {
+          const ts = Math.max(performance.now(), (state.lastTs || 0) + 1);
+          state.lastTs = ts;
+          onResults(toLegacy(landmarker.detectForVideo(detectInput(), ts)));
           state.detectMs = state.detectMs * 0.8 + (performance.now() - t0) * 0.2;
         })
         .catch((e) => detectFailed('识别出错 ' + ((e && e.message) || e), src))
@@ -412,9 +468,13 @@ function setButtons(on) {
 async function loadModel() {
   const t0 = performance.now();
   log('开始加载识别模型');
-  createHands();
   try {
-    await hands.initialize();
+    await fetchWithProgress('./tasks/wasm/vision_wasm_internal.wasm', '识别程序（约 14MB）');
+    log('识别程序下载完成 ' + ((performance.now() - t0) / 1000).toFixed(1) + 's');
+    if (!modelBuf) modelBuf = await fetchWithProgress('./models/hand_landmarker.task', '手部模型（约 8MB）');
+    log('手部模型下载完成 ' + ((performance.now() - t0) / 1000).toFixed(1) + 's');
+    setStatus('正在启动识别…');
+    await createLandmarker(state.delegate);
     state.modelReady = true;
     log('模型加载完成 ' + ((performance.now() - t0) / 1000).toFixed(1) + 's');
   } catch (e) {
@@ -468,9 +528,18 @@ $('debugBtn').onclick = () => {
   $('log').style.display = state.debug ? 'block' : 'none';
   updateLabels();
 };
-$('modelBtn').onclick = () => {
-  state.model = state.model ? 0 : 1;
-  if (hands) hands.setOptions({ modelComplexity: state.model });
+$('modelBtn').onclick = async () => {
+  if (!state.modelReady) return;
+  state.modelReady = false;
+  const next = state.delegate === 'CPU' ? 'GPU' : 'CPU';
+  log('切换到' + (next === 'CPU' ? 'CPU' : '显卡') + '计算');
+  try {
+    await createLandmarker(next);
+    state.delegate = next;
+  } catch (e) {
+    log('切换失败 ' + e.message);
+  }
+  state.modelReady = true;
   updateLabels();
 };
 $('wristMinus').onclick = () => {
