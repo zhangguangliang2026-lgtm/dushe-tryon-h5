@@ -684,7 +684,12 @@
     hits: 0,
     since: performance.now(),
     detectMs: 0,
-    handLog: []
+    handLog: [],
+    fit: "contain",
+    // contain 显示完整画面 / cover 铺满屏幕
+    cams: [],
+    camIndex: -1,
+    camLabel: ""
   };
   var filter = createPointsFilter(21, { minCutoff: 1, beta: 0.05 });
   function beads() {
@@ -717,6 +722,9 @@
     $("sampleName").textContent = SAMPLES[state.sample].title + " \xB7 \u624B\u56F4 " + state.wristCm + "cm";
     $("modelBtn").textContent = state.model ? "\u6A21\u578B\uFF1A\u5B8C\u6574" : "\u6A21\u578B\uFF1A\u7CBE\u7B80";
     $("debugBtn").textContent = state.debug ? "\u5173\u8C03\u8BD5" : "\u8C03\u8BD5\u70B9";
+    $("fitBtn").textContent = state.fit === "cover" ? "\u753B\u9762\uFF1A\u94FA\u6EE1" : "\u753B\u9762\uFF1A\u5B8C\u6574";
+    const n = state.cams.length;
+    $("camBtn").textContent = n > 1 ? "\u6444\u50CF\u5934 " + (state.camIndex + 1) + "/" + n : "\u5207\u6362\u6444\u50CF\u5934";
   }
   var hands = null;
   function createHands() {
@@ -778,7 +786,7 @@
       canvas.height = vh;
     }
     const box = $("viewport").getBoundingClientRect();
-    const s = Math.max(box.width / vw, box.height / vh);
+    const s = state.fit === "cover" ? Math.max(box.width / vw, box.height / vh) : Math.min(box.width / vw, box.height / vh);
     canvas.style.width = vw * s + "px";
     canvas.style.height = vh * s + "px";
     canvas.style.left = (box.width - vw * s) / 2 + "px";
@@ -822,7 +830,10 @@
     if (now - state.since > 1e3) {
       const sec = (now - state.since) / 1e3;
       $("fps").textContent = Math.round(state.frames / sec) + " \u5E27/\u79D2 \xB7 \u8BC6\u522B " + Math.round(state.detects / sec) + " \u6B21/\u79D2 \xB7 \u8BA4\u51FA " + Math.round(state.hits / sec) + " \xB7 " + Math.round(state.detectMs) + "ms";
-      if (state.debug && state.roll != null) $("fps").textContent += " \xB7 \u8F6C " + Math.round(state.roll * 180 / Math.PI) + "\xB0";
+      if (state.debug) {
+        $("fps").textContent += " \xB7 " + video.videoWidth + "\xD7" + video.videoHeight + " \xB7 " + state.camLabel;
+        if (state.roll != null) $("fps").textContent += " \xB7 \u8F6C " + Math.round(state.roll * 180 / Math.PI) + "\xB0";
+      }
       setStatus(state.hits ? "" : "\u5F20\u5F00\u624B\u638C\u5BF9\u51C6\u955C\u5934\uFF0C\u8BA4\u51FA\u540E\u53EF\u4EE5\u968F\u610F\u8F6C\u52A8\u624B\u8155");
       state.frames = 0;
       state.detects = 0;
@@ -847,6 +858,22 @@
     }
     requestAnimationFrame(loop);
   }
+  async function listBackFirst() {
+    try {
+      const all = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput");
+      const isFront = (d) => /front|user|前/i.test(d.label);
+      return all.filter((d) => !isFront(d)).concat(all.filter(isFront));
+    } catch (e) {
+      return [];
+    }
+  }
+  async function widest(track) {
+    try {
+      const cap = track.getCapabilities ? track.getCapabilities() : {};
+      if (cap.zoom && cap.zoom.min != null) await track.applyConstraints({ advanced: [{ zoom: cap.zoom.min }] });
+    } catch (e) {
+    }
+  }
   async function startCamera() {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setStatus("\u8FD9\u4E2A\u6D4F\u89C8\u5668\u4E0D\u80FD\u6253\u5F00\u6444\u50CF\u5934\u3002\u8BF7\u70B9\u53F3\u4E0A\u89D2\u300C\u2026\u300D\uFF0C\u9009\u300C\u5728\u6D4F\u89C8\u5668\u6253\u5F00\u300D\u518D\u8BD5", true);
@@ -854,16 +881,32 @@
     }
     try {
       if (video.srcObject) video.srcObject.getTracks().forEach((t) => t.stop());
+      const cam = state.cams[state.camIndex];
+      const constraint = cam ? { deviceId: { exact: cam.deviceId } } : { facingMode: state.facing };
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
-        video: { facingMode: state.facing, width: { ideal: 640 }, height: { ideal: 480 } }
+        video: Object.assign(constraint, { width: { ideal: 640 }, height: { ideal: 480 } })
       });
+      const track = stream.getVideoTracks()[0];
+      await widest(track);
+      const set = track.getSettings ? track.getSettings() : {};
+      if (set.facingMode) state.facing = set.facingMode === "user" ? "user" : "environment";
+      else if (cam) state.facing = /front|user|前/i.test(cam.label) ? "user" : "environment";
+      state.camLabel = cam && cam.label || (state.facing === "user" ? "\u524D\u7F6E" : "\u540E\u7F6E");
       video.srcObject = stream;
       await video.play();
-      state.running = true;
+      if (!state.cams.length) state.cams = await listBackFirst();
+      if (state.camIndex < 0 && state.cams.length) {
+        const i = state.cams.findIndex((d) => set.deviceId && d.deviceId === set.deviceId);
+        state.camIndex = i >= 0 ? i : 0;
+      }
+      if (!state.running) {
+        state.running = true;
+        setStatus("\u6B63\u5728\u52A0\u8F7D\u8BC6\u522B\u6A21\u578B\uFF08\u9996\u6B21\u7EA6 10MB\uFF09\u2026");
+        requestAnimationFrame(loop);
+      }
       $("start").style.display = "none";
-      setStatus("\u6B63\u5728\u52A0\u8F7D\u8BC6\u522B\u6A21\u578B\uFF08\u9996\u6B21\u7EA6 10MB\uFF09\u2026");
-      requestAnimationFrame(loop);
+      updateLabels();
     } catch (e) {
       setStatus("\u6444\u50CF\u5934\u6253\u4E0D\u5F00\uFF1A" + (e.name || "") + " " + (e.message || "") + "\u3002\u8BF7\u5141\u8BB8\u4F7F\u7528\u6444\u50CF\u5934\uFF0C\u6216\u6362\u6D4F\u89C8\u5668\u6253\u5F00", true);
     }
@@ -879,10 +922,16 @@
     updateLabels();
   };
   $("camBtn").onclick = () => {
-    state.facing = state.facing === "user" ? "environment" : "user";
+    if (state.cams.length > 1) state.camIndex = (state.camIndex + 1) % state.cams.length;
+    else state.facing = state.facing === "user" ? "environment" : "user";
     state.last = null;
     filter.reset();
     startCamera();
+  };
+  $("fitBtn").onclick = () => {
+    state.fit = state.fit === "cover" ? "contain" : "cover";
+    layoutCanvas();
+    updateLabels();
   };
   $("debugBtn").onclick = () => {
     state.debug = !state.debug;
