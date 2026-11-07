@@ -36,8 +36,6 @@ const state = {
   detectMs: 0,
   handLog: [],
   fit: 'contain', // contain 显示完整画面 / cover 铺满屏幕
-  cams: [],
-  camIndex: -1,
   camLabel: '',
 };
 const filter = createPointsFilter(21, { minCutoff: 1.0, beta: 0.05 });
@@ -77,8 +75,7 @@ function updateLabels() {
   $('modelBtn').textContent = state.model ? '模型：完整' : '模型：精简';
   $('debugBtn').textContent = state.debug ? '关调试' : '调试点';
   $('fitBtn').textContent = state.fit === 'cover' ? '画面：铺满' : '画面：完整';
-  const n = state.cams.length;
-  $('camBtn').textContent = n > 1 ? '摄像头 ' + (state.camIndex + 1) + '/' + n : '切换摄像头';
+  $('camBtn').textContent = state.facing === 'user' ? '换后置' : '换前置';
 }
 
 // ---------- 识别 ----------
@@ -211,12 +208,14 @@ function drawFrame() {
 
 async function loop() {
   if (!state.running) return;
+  if (video.srcObject) checkStuck(performance.now());
   if (video.readyState >= 2) {
     layoutCanvas();
     drawFrame();
     if (!state.busy) {
       state.busy = true;
       const t0 = performance.now();
+      const guard = setTimeout(() => (state.busy = false), 3000); // 识别卡住时不让整个页面停住
       hands
         .send({ image: video })
         .then(() => {
@@ -224,6 +223,7 @@ async function loop() {
         })
         .catch((e) => setStatus('识别出错：' + e.message, true))
         .finally(() => {
+          clearTimeout(guard);
           state.busy = false;
         });
     }
@@ -231,50 +231,33 @@ async function loop() {
   requestAnimationFrame(loop);
 }
 
-async function listBackFirst() {
-  try {
-    const all = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === 'videoinput');
-    const isFront = (d) => /front|user|前/i.test(d.label);
-    return all.filter((d) => !isFront(d)).concat(all.filter(isFront));
-  } catch (e) {
-    return [];
-  }
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function openStream(plain) {
+  const video0 = plain ? { facingMode: state.facing } : { facingMode: state.facing, width: { ideal: 640 }, height: { ideal: 480 } };
+  return navigator.mediaDevices.getUserMedia({ audio: false, video: video0 });
 }
 
-// 有些手机默认会放大一点，能调就调到最广
-async function widest(track) {
-  try {
-    const cap = track.getCapabilities ? track.getCapabilities() : {};
-    if (cap.zoom && cap.zoom.min != null) await track.applyConstraints({ advanced: [{ zoom: cap.zoom.min }] });
-  } catch (e) {}
-}
-
-async function startCamera() {
+async function startCamera(plain) {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     setStatus('这个浏览器不能打开摄像头。请点右上角「…」，选「在浏览器打开」再试', true);
     return;
   }
+  const token = (state.camToken = (state.camToken || 0) + 1);
   try {
-    if (video.srcObject) video.srcObject.getTracks().forEach((t) => t.stop());
-    const cam = state.cams[state.camIndex];
-    const constraint = cam ? { deviceId: { exact: cam.deviceId } } : { facingMode: state.facing };
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: Object.assign(constraint, { width: { ideal: 640 }, height: { ideal: 480 } }),
-    });
-    const track = stream.getVideoTracks()[0];
-    await widest(track);
-    const set = track.getSettings ? track.getSettings() : {};
-    if (set.facingMode) state.facing = set.facingMode === 'user' ? 'user' : 'environment';
-    else if (cam) state.facing = /front|user|前/i.test(cam.label) ? 'user' : 'environment';
-    state.camLabel = (cam && cam.label) || (state.facing === 'user' ? '前置' : '后置');
+    if (video.srcObject) {
+      video.srcObject.getTracks().forEach((t) => t.stop());
+      video.srcObject = null;
+      await wait(300); // 有的手机要等上一个摄像头完全释放
+    }
+    const stream = await openStream(plain);
+    if (token !== state.camToken) return stream.getTracks().forEach((t) => t.stop());
     video.srcObject = stream;
     await video.play();
-    if (!state.cams.length) state.cams = await listBackFirst();
-    if (state.camIndex < 0 && state.cams.length) {
-      const i = state.cams.findIndex((d) => set.deviceId && d.deviceId === set.deviceId);
-      state.camIndex = i >= 0 ? i : 0;
-    }
+    state.camLabel = (state.facing === 'user' ? '前置' : '后置') + (plain ? '·默认' : '');
+    state.lastVideoTime = -1;
+    state.videoStuckSince = performance.now();
+    state.plain = !!plain;
     if (!state.running) {
       state.running = true;
       setStatus('正在加载识别模型（首次约 10MB）…');
@@ -283,8 +266,22 @@ async function startCamera() {
     $('start').style.display = 'none';
     updateLabels();
   } catch (e) {
+    if (!plain) return startCamera(true);
     setStatus('摄像头打不开：' + (e.name || '') + ' ' + (e.message || '') + '。请允许使用摄像头，或换浏览器打开', true);
   }
+}
+
+// 摄像头画面 2.5 秒没有变化：换默认参数重开一次，还不行就提示
+function checkStuck(now) {
+  if (video.currentTime !== state.lastVideoTime) {
+    state.lastVideoTime = video.currentTime;
+    state.videoStuckSince = now;
+    return;
+  }
+  if (now - state.videoStuckSince < 2500) return;
+  state.videoStuckSince = now + 1e9;
+  if (!state.plain) startCamera(true);
+  else setStatus('摄像头没有画面。请点「切换摄像头」，或点右上角「…」选「在浏览器打开」', true);
 }
 
 // ---------- 按钮 ----------
@@ -292,19 +289,17 @@ $('start').onclick = async () => {
   setStatus('准备中…');
   await loadBeadImages();
   createHands();
-  startCamera();
+  startCamera(false);
 };
 $('nextBtn').onclick = () => {
   state.sample = (state.sample + 1) % SAMPLES.length;
   updateLabels();
 };
 $('camBtn').onclick = () => {
-  // 依次切换手机上的每个摄像头（有的手机后面有广角镜头），没有列表时在前后之间切换
-  if (state.cams.length > 1) state.camIndex = (state.camIndex + 1) % state.cams.length;
-  else state.facing = state.facing === 'user' ? 'environment' : 'user';
+  state.facing = state.facing === 'user' ? 'environment' : 'user';
   state.last = null;
   filter.reset();
-  startCamera();
+  startCamera(false);
 };
 $('fitBtn').onclick = () => {
   state.fit = state.fit === 'cover' ? 'contain' : 'cover';

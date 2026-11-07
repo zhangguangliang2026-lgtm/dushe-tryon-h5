@@ -687,8 +687,6 @@
     handLog: [],
     fit: "contain",
     // contain 显示完整画面 / cover 铺满屏幕
-    cams: [],
-    camIndex: -1,
     camLabel: ""
   };
   var filter = createPointsFilter(21, { minCutoff: 1, beta: 0.05 });
@@ -723,8 +721,7 @@
     $("modelBtn").textContent = state.model ? "\u6A21\u578B\uFF1A\u5B8C\u6574" : "\u6A21\u578B\uFF1A\u7CBE\u7B80";
     $("debugBtn").textContent = state.debug ? "\u5173\u8C03\u8BD5" : "\u8C03\u8BD5\u70B9";
     $("fitBtn").textContent = state.fit === "cover" ? "\u753B\u9762\uFF1A\u94FA\u6EE1" : "\u753B\u9762\uFF1A\u5B8C\u6574";
-    const n = state.cams.length;
-    $("camBtn").textContent = n > 1 ? "\u6444\u50CF\u5934 " + (state.camIndex + 1) + "/" + n : "\u5207\u6362\u6444\u50CF\u5934";
+    $("camBtn").textContent = state.facing === "user" ? "\u6362\u540E\u7F6E" : "\u6362\u524D\u7F6E";
   }
   var hands = null;
   function createHands() {
@@ -843,63 +840,49 @@
   }
   async function loop() {
     if (!state.running) return;
+    if (video.srcObject) checkStuck(performance.now());
     if (video.readyState >= 2) {
       layoutCanvas();
       drawFrame();
       if (!state.busy) {
         state.busy = true;
         const t0 = performance.now();
+        const guard = setTimeout(() => state.busy = false, 3e3);
         hands.send({ image: video }).then(() => {
           state.detectMs = state.detectMs * 0.8 + (performance.now() - t0) * 0.2;
         }).catch((e) => setStatus("\u8BC6\u522B\u51FA\u9519\uFF1A" + e.message, true)).finally(() => {
+          clearTimeout(guard);
           state.busy = false;
         });
       }
     }
     requestAnimationFrame(loop);
   }
-  async function listBackFirst() {
-    try {
-      const all = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput");
-      const isFront = (d) => /front|user|前/i.test(d.label);
-      return all.filter((d) => !isFront(d)).concat(all.filter(isFront));
-    } catch (e) {
-      return [];
-    }
+  var wait = (ms) => new Promise((r) => setTimeout(r, ms));
+  async function openStream(plain) {
+    const video0 = plain ? { facingMode: state.facing } : { facingMode: state.facing, width: { ideal: 640 }, height: { ideal: 480 } };
+    return navigator.mediaDevices.getUserMedia({ audio: false, video: video0 });
   }
-  async function widest(track) {
-    try {
-      const cap = track.getCapabilities ? track.getCapabilities() : {};
-      if (cap.zoom && cap.zoom.min != null) await track.applyConstraints({ advanced: [{ zoom: cap.zoom.min }] });
-    } catch (e) {
-    }
-  }
-  async function startCamera() {
+  async function startCamera(plain) {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setStatus("\u8FD9\u4E2A\u6D4F\u89C8\u5668\u4E0D\u80FD\u6253\u5F00\u6444\u50CF\u5934\u3002\u8BF7\u70B9\u53F3\u4E0A\u89D2\u300C\u2026\u300D\uFF0C\u9009\u300C\u5728\u6D4F\u89C8\u5668\u6253\u5F00\u300D\u518D\u8BD5", true);
       return;
     }
+    const token = state.camToken = (state.camToken || 0) + 1;
     try {
-      if (video.srcObject) video.srcObject.getTracks().forEach((t) => t.stop());
-      const cam = state.cams[state.camIndex];
-      const constraint = cam ? { deviceId: { exact: cam.deviceId } } : { facingMode: state.facing };
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: Object.assign(constraint, { width: { ideal: 640 }, height: { ideal: 480 } })
-      });
-      const track = stream.getVideoTracks()[0];
-      await widest(track);
-      const set = track.getSettings ? track.getSettings() : {};
-      if (set.facingMode) state.facing = set.facingMode === "user" ? "user" : "environment";
-      else if (cam) state.facing = /front|user|前/i.test(cam.label) ? "user" : "environment";
-      state.camLabel = cam && cam.label || (state.facing === "user" ? "\u524D\u7F6E" : "\u540E\u7F6E");
+      if (video.srcObject) {
+        video.srcObject.getTracks().forEach((t) => t.stop());
+        video.srcObject = null;
+        await wait(300);
+      }
+      const stream = await openStream(plain);
+      if (token !== state.camToken) return stream.getTracks().forEach((t) => t.stop());
       video.srcObject = stream;
       await video.play();
-      if (!state.cams.length) state.cams = await listBackFirst();
-      if (state.camIndex < 0 && state.cams.length) {
-        const i = state.cams.findIndex((d) => set.deviceId && d.deviceId === set.deviceId);
-        state.camIndex = i >= 0 ? i : 0;
-      }
+      state.camLabel = (state.facing === "user" ? "\u524D\u7F6E" : "\u540E\u7F6E") + (plain ? "\xB7\u9ED8\u8BA4" : "");
+      state.lastVideoTime = -1;
+      state.videoStuckSince = performance.now();
+      state.plain = !!plain;
       if (!state.running) {
         state.running = true;
         setStatus("\u6B63\u5728\u52A0\u8F7D\u8BC6\u522B\u6A21\u578B\uFF08\u9996\u6B21\u7EA6 10MB\uFF09\u2026");
@@ -908,25 +891,36 @@
       $("start").style.display = "none";
       updateLabels();
     } catch (e) {
+      if (!plain) return startCamera(true);
       setStatus("\u6444\u50CF\u5934\u6253\u4E0D\u5F00\uFF1A" + (e.name || "") + " " + (e.message || "") + "\u3002\u8BF7\u5141\u8BB8\u4F7F\u7528\u6444\u50CF\u5934\uFF0C\u6216\u6362\u6D4F\u89C8\u5668\u6253\u5F00", true);
     }
+  }
+  function checkStuck(now) {
+    if (video.currentTime !== state.lastVideoTime) {
+      state.lastVideoTime = video.currentTime;
+      state.videoStuckSince = now;
+      return;
+    }
+    if (now - state.videoStuckSince < 2500) return;
+    state.videoStuckSince = now + 1e9;
+    if (!state.plain) startCamera(true);
+    else setStatus("\u6444\u50CF\u5934\u6CA1\u6709\u753B\u9762\u3002\u8BF7\u70B9\u300C\u5207\u6362\u6444\u50CF\u5934\u300D\uFF0C\u6216\u70B9\u53F3\u4E0A\u89D2\u300C\u2026\u300D\u9009\u300C\u5728\u6D4F\u89C8\u5668\u6253\u5F00\u300D", true);
   }
   $("start").onclick = async () => {
     setStatus("\u51C6\u5907\u4E2D\u2026");
     await loadBeadImages();
     createHands();
-    startCamera();
+    startCamera(false);
   };
   $("nextBtn").onclick = () => {
     state.sample = (state.sample + 1) % SAMPLES.length;
     updateLabels();
   };
   $("camBtn").onclick = () => {
-    if (state.cams.length > 1) state.camIndex = (state.camIndex + 1) % state.cams.length;
-    else state.facing = state.facing === "user" ? "environment" : "user";
+    state.facing = state.facing === "user" ? "environment" : "user";
     state.last = null;
     filter.reset();
-    startCamera();
+    startCamera(false);
   };
   $("fitBtn").onclick = () => {
     state.fit = state.fit === "cover" ? "contain" : "cover";
