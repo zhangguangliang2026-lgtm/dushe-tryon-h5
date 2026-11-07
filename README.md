@@ -8,8 +8,8 @@
 
 ## 识别方案（0.8 起）
 
-- 方案 B（默认）：MediaPipe Tasks，CPU 计算。运行库从国内 npm 镜像（registry.npmmirror.com）下载；手部模型从镜像上的 npm 压缩包解压得到，同时从 GitHub、jsDelivr 下载，谁快用谁。
-- 方案 A：旧版 MediaPipe Hands，全部文件走国内镜像。
+- 方案 B：MediaPipe Tasks，CPU 计算。运行库从国内 npm 镜像（registry.npmmirror.com）下载；手部模型从镜像上的 npm 压缩包解压得到，同时从 GitHub、jsDelivr 下载，谁快用谁。
+- 方案 A（0.9 起默认，华为真机上更快）：旧版 MediaPipe Hands，全部文件走国内镜像。
 - 一个方案加载失败或识别卡住，页面会自动换另一个方案重新打开。
 
 ## 第三方组件

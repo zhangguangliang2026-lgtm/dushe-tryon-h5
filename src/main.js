@@ -9,8 +9,12 @@ const { SAMPLES } = require('./lib/beads');
 const { createPointsFilter } = require('./lib/one-euro');
 const { hand3d } = require('./hand3d');
 
-const HOLD_MS = 1200; // 手短暂认不出时保持的时间
+const HOLD_MS = 700; // 手认不出、皮肤也跟不住时保持的时间
+const TRACK_MS = 3000; // 手认不出、但能跟住手腕皮肤时最多保持的时间
 const FADE_MS = 400;
+const PITCH_MAX = 0.3; // 俯仰最多按 ±0.3 算：真机上估得偏大，弧线会弯成“笑脸”
+const PITCH_DEAD = 0.06; // 很小的俯仰当作 0，手链不会来回晃
+const { grabPatch, matchPatch } = require('./lib/skin-track');
 const FOLLOW = 0.4; // 显示位置每帧靠近识别位置的比例
 const PITCH_GAIN = 0.5; // 手腕弯曲时手掌方向不等于前臂方向，只用一半的俯仰
 
@@ -129,7 +133,7 @@ function legacyEngine(base) {
     async load() {
       if (!window.Hands) await withTimeout(loadScript(base + 'hands.js'), 20000, '方案A脚本');
       hands = new window.Hands({ locateFile: (f) => base + f });
-      hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+      hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.6, minTrackingConfidence: 0.4 });
       hands.onResults((r) => {
         if (pending) pending(r);
       });
@@ -187,6 +191,8 @@ async function fetchModel() {
         }
         if (u === MODEL_TGZ) buf = await untarModel(buf);
         ctrls.forEach((c, j) => j !== i && c.abort());
+        if (fetchModel.won) return buf;
+        fetchModel.won = true;
         log('手部模型来自 ' + ['国内镜像', 'GitHub', 'jsDelivr', 'jsDelivr-CF'][i] + ' ' + ((performance.now() - T0) / 1000).toFixed(1) + 's');
         return buf;
       })
@@ -242,6 +248,9 @@ function tasksEngine(delegate) {
           baseOptions: { modelAssetBuffer: model, delegate },
           runningMode: 'VIDEO',
           numHands: 1,
+          minHandDetectionConfidence: 0.6,
+          minHandPresenceConfidence: 0.4,
+          minTrackingConfidence: 0.4,
         }),
         60000,
         '方案B模型启动'
@@ -295,7 +304,8 @@ async function loadEngine(order) {
 }
 // 两个方案的运行库放在同一个页面里会冲突，所以换方案时重新打开页面（带上参数自动开始）
 const params = new URLSearchParams(location.search);
-const WANT = params.get('engine') === 'A' ? 'A' : 'B';
+// 华为真机实测：方案 A 每秒 14–27 次、方案 B 11–15 次，所以默认 A
+const WANT = params.get('engine') === 'B' ? 'B' : 'A';
 const ORDER_ALL =
   WANT === 'A'
     ? [() => legacyEngine(LEGACY_BASES[0]), () => legacyEngine(LEGACY_BASES[1])]
@@ -305,7 +315,7 @@ function reloadWith(engineName, reason) {
   if (tried.indexOf(engineName) >= 0) return false;
   tried.push(WANT);
   log('换方案' + engineName + '：' + reason);
-  const q = new URLSearchParams({ engine: engineName, auto: '1', tried: tried.join(','), why: '方案' + WANT + ' ' + reason, v: '8' });
+  const q = new URLSearchParams({ engine: engineName, auto: '1', tried: tried.join(','), why: '方案' + WANT + ' ' + reason, v: '9' });
   setTimeout(() => location.replace(location.pathname + '?' + q.toString()), 800);
   return true;
 }
@@ -339,6 +349,65 @@ function stickyHand(label, score) {
   return hand.label;
 }
 
+// 手形是否合理：五个指根和手腕要张成一个像样的手掌，避免把杂物认成手
+function plausibleHand(lm) {
+  const d = (a, b) => Math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y);
+  const palm = d(0, 9);
+  const knuckles = d(5, 17);
+  if (!(palm > 0.03)) return false;
+  const r = knuckles / palm;
+  return r > 0.15 && r < 1.6;
+}
+
+// 手认不出时，跟着手腕皮肤的纹理（痣、汗毛、明暗）移动手链，最多 3 秒
+const trackCanvas = document.createElement('canvas');
+const trackCtx = trackCanvas.getContext('2d', { willReadFrequently: true });
+function trackFrame() {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  const s = 240 / Math.max(vw, vh);
+  const w = Math.round(vw * s);
+  const h = Math.round(vh * s);
+  if (trackCanvas.width !== w || trackCanvas.height !== h) {
+    trackCanvas.width = w;
+    trackCanvas.height = h;
+  }
+  trackCtx.drawImage(video, 0, 0, w, h);
+  return { bytes: trackCtx.getImageData(0, 0, w, h).data, w, h };
+}
+function followSkin(now) {
+  if (!state.trackPoint) return false;
+  const f = trackFrame();
+  const cx = state.trackPoint.x * f.w;
+  const cy = state.trackPoint.y * f.h;
+  if (!state.patch) {
+    state.patch = grabPatch(f.bytes, f.w, f.h, cx, cy);
+    state.trackingSkin = !!state.patch;
+    state.skinOkAt = now;
+    return !!state.patch;
+  }
+  const m = matchPatch(f.bytes, f.w, f.h, state.patch);
+  if (!m || m.quality < 0.2) {
+    state.skinBad = (state.skinBad || 0) + 1;
+    if (state.skinBad > 3) {
+      state.patch = null;
+      state.trackPoint = null;
+      return false;
+    }
+    return true;
+  }
+  state.skinBad = 0;
+  const dx = m.dx / f.w;
+  const dy = m.dy / f.h;
+  const move = (p) => ({ x: p.x + dx, y: p.y + dy });
+  state.last = state.last.map(move);
+  if (state.shown) state.shown = state.shown.map(move);
+  state.trackPoint = move(state.trackPoint);
+  state.patch = grabPatch(f.bytes, f.w, f.h, state.trackPoint.x * f.w, state.trackPoint.y * f.h);
+  state.skinOkAt = now;
+  return !!state.patch;
+}
+
 function onResults(res) {
   state.detects += 1;
   if (!state.firstResult) {
@@ -346,7 +415,23 @@ function onResults(res) {
     log('第一次识别完成');
   }
   const lm = res.multiHandLandmarks && res.multiHandLandmarks[0];
-  if (!lm) return;
+  if (!lm) {
+    state.acq = 0;
+    return;
+  }
+  const hd0 = res.multiHandedness && res.multiHandedness[0];
+  // 新认出一只手时更严格：把握要高，而且连续两帧都认出，才开始戴手链（减少把海报、人脸认成手）
+  if (!state.last || state.trackingSkin) {
+    const score = hd0 && hd0.score != null ? hd0.score : 1;
+    if (score < 0.75 || !plausibleHand(lm)) {
+      state.acq = 0;
+      return;
+    }
+    state.acq = (state.acq || 0) + 1;
+    if (state.acq < 2 && !state.trackingSkin) return;
+  }
+  state.trackingSkin = false;
+  state.patch = null;
   state.hits += 1;
   const now = performance.now();
   const pts = filter.filter(lm.map((p) => ({ x: p.x, y: p.y })), now / 1000);
@@ -364,9 +449,13 @@ function onResults(res) {
       if (state.roll > Math.PI) state.roll -= 2 * Math.PI;
       if (state.roll < -Math.PI) state.roll += 2 * Math.PI;
     }
-    state.pitch = state.pitch * 0.6 + h.pitch * PITCH_GAIN * 0.4;
-    state.cosPitch = Math.sqrt(1 - Math.min(0.8, Math.abs(h.pitch)) ** 2 * PITCH_GAIN);
+    let pt = h.pitch * PITCH_GAIN;
+    pt = Math.abs(pt) < PITCH_DEAD ? 0 : pt - Math.sign(pt) * PITCH_DEAD;
+    pt = Math.max(-PITCH_MAX, Math.min(PITCH_MAX, pt));
+    state.pitch = state.pitch * 0.7 + pt * 0.3;
+    state.cosPitch = Math.sqrt(1 - Math.min(0.8, Math.abs(h.pitch)) ** 2);
     state.spinDir = h.spinDir;
+    state.dbg = { pitchRaw: +h.pitch.toFixed(2), roll: Math.round((h.roll * 180) / Math.PI), hand: hand.label };
   }
   state.last = pts;
   state.lastSeen = now;
@@ -394,20 +483,39 @@ function layoutCanvas() {
   canvas.style.transform = state.facing === 'user' ? 'scaleX(-1)' : 'none';
 }
 
+// 手腕在画面里有多宽 → 每毫米多少像素。
+// 华为真机录像实测：近距离拍时手腕离镜头更近、看起来更大，实际宽度约为指根宽度（关键点 5→17）的 1.3 倍，
+// 原来按手掌长度推算的结果只有实际的一半左右，手链因此又小又细。
+// 取两种估计里较大的：指根宽度（手掌正对镜头时准）和手掌长度（侧着时准，按 3D 方向补回缩短）。
+const KNUCKLE_TO_WRIST = 1.3;
+const PALM_TO_WRIST = 0.9;
+function wristScale(pose, W, H) {
+  const P = state.shown;
+  const kn = Math.hypot((P[5].x - P[17].x) * W, (P[5].y - P[17].y) * H);
+  const palm = pose.palmPx / Math.max(0.6, state.cosPitch || 1);
+  const wristPx = Math.max(KNUCKLE_TO_WRIST * kn, PALM_TO_WRIST * palm);
+  const target = wristPx / (2 * core.BODY.wristSemiBreadth(pose.wristMm));
+  state.scale = state.scale ? state.scale * 0.7 + target * 0.3 : target;
+  return state.scale;
+}
+
 function drawFrame() {
   const W = canvas.width;
   const H = canvas.height;
   ctx.drawImage(video, 0, 0, W, H);
   const now = performance.now();
-  const age = now - state.lastSeen;
+  let age = now - state.lastSeen;
   state.frames += 1;
+  // 手认不出了：先试着跟住手腕皮肤，跟得住就继续戴着
+  if (state.last && age > 150 && age < TRACK_MS) {
+    if (followSkin(now) && now - state.skinOkAt < 300) age = Math.min(age, HOLD_MS - 1);
+  }
   if (state.last && age < HOLD_MS + FADE_MS) {
     if (!state.shown) state.shown = state.last.map((p) => ({ x: p.x, y: p.y }));
     state.shown = state.shown.map((p, i) => ({ x: p.x + (state.last[i].x - p.x) * FOLLOW, y: p.y + (state.last[i].y - p.y) * FOLLOW }));
     let pose = core.estimateWristPose(state.shown, W, H, state.wristCm * 10);
     if (pose) {
-      // 手斜着时，手掌在画面里被缩短，按 3D 方向把比例补回来
-      pose = Object.assign({}, pose, { pxPerMm: pose.pxPerMm / Math.max(0.6, state.cosPitch || 1) });
+      pose = Object.assign({}, pose, { pxPerMm: wristScale(pose, W, H) });
       const list = beads();
       let rotate = 0;
       if (state.roll != null && state.spinDir) {
@@ -419,12 +527,20 @@ function drawFrame() {
       const layout = core.computeLayout({ pose, beads: list, pitch3d: state.pitch, adjust: { rotate } });
       ctx.globalAlpha = age < HOLD_MS ? 1 : Math.max(0, 1 - (age - HOLD_MS) / FADE_MS);
       render.drawTryon(ctx, layout, state.images, { width: W, height: H, shadow: true });
+      state.drawn = now;
+      state.dbgPose = { palmPx: Math.round(pose.palmPx), pxPerMm: +pose.pxPerMm.toFixed(2), halfW: Math.round(layout.band.halfWidth), pitch: +state.pitch.toFixed(2), poseRoll: Math.round((pose.roll * 180) / Math.PI) };
+      // 记住手链中心（0–1 坐标），手认不出时从这里开始跟皮肤
+      if (now - state.lastSeen < 150) state.trackPoint = { x: layout.band.cx / W, y: layout.band.cy / H };
       ctx.globalAlpha = 1;
       if (state.debug) render.drawDebug(ctx, state.last, W, H, layout);
     }
   } else {
     state.shown = null;
     state.roll = null;
+    state.scale = 0;
+    state.patch = null;
+    state.trackPoint = null;
+    state.trackingSkin = false;
     hand.label = null;
     hand.other = 0;
     if (state.last) filter.reset();
@@ -667,7 +783,7 @@ $('debugBtn').onclick = () => {
   updateLabels();
 };
 $('modelBtn').onclick = () => {
-  const q = new URLSearchParams({ engine: state.engineName === 'A' ? 'B' : 'A', auto: '1', v: '8' });
+  const q = new URLSearchParams({ engine: state.engineName === 'A' ? 'B' : 'A', auto: '1', v: '9' });
   location.replace(location.pathname + '?' + q.toString());
 };
 $('wristMinus').onclick = () => {

@@ -652,14 +652,104 @@
     }
   });
 
+  // src/lib/skin-track.js
+  var require_skin_track = __commonJS({
+    "src/lib/skin-track.js"(exports, module) {
+      var STEP = 2;
+      var HALF = 12;
+      var RADIUS = 16;
+      var MIN_TEXTURE = 0.6;
+      function gray(bytes, i) {
+        return bytes[i] * 0.299 + bytes[i + 1] * 0.587 + bytes[i + 2] * 0.114;
+      }
+      function grabPatch2(bytes, fw, fh, cx, cy) {
+        const n = HALF * 2 + 1;
+        const out = new Float32Array(n * n);
+        const x0 = Math.round(cx) - HALF * STEP;
+        const y0 = Math.round(cy) - HALF * STEP;
+        if (x0 < 0 || y0 < 0 || x0 + (n - 1) * STEP >= fw || y0 + (n - 1) * STEP >= fh) return null;
+        let sum = 0;
+        for (let j = 0; j < n; j++) {
+          for (let i = 0; i < n; i++) {
+            const v = gray(bytes, ((y0 + j * STEP) * fw + x0 + i * STEP) * 4);
+            out[j * n + i] = v;
+            sum += v;
+          }
+        }
+        const mean = sum / out.length;
+        let energy = 0;
+        for (let k = 0; k < out.length; k++) {
+          out[k] -= mean;
+          energy += Math.abs(out[k]);
+        }
+        return { data: out, n, cx: Math.round(cx), cy: Math.round(cy), texture: energy / out.length };
+      }
+      function sadAt(bytes, fw, fh, patch, ox, oy, limit) {
+        const { n, data } = patch;
+        const x0 = ox - HALF * STEP;
+        const y0 = oy - HALF * STEP;
+        if (x0 < 0 || y0 < 0 || x0 + (n - 1) * STEP >= fw || y0 + (n - 1) * STEP >= fh) return Infinity;
+        let sum = 0;
+        for (let j = 0; j < n; j += 2) for (let i = 0; i < n; i += 2) sum += gray(bytes, ((y0 + j * STEP) * fw + x0 + i * STEP) * 4);
+        const cnt = Math.ceil(n / 2) * Math.ceil(n / 2);
+        const mean = sum / cnt;
+        let sad = 0;
+        for (let j = 0; j < n; j++) {
+          const row = (y0 + j * STEP) * fw;
+          for (let i = 0; i < n; i++) {
+            sad += Math.abs(gray(bytes, (row + x0 + i * STEP) * 4) - mean - data[j * n + i]);
+          }
+          if (sad > limit) return sad;
+        }
+        return sad;
+      }
+      function matchPatch2(bytes, fw, fh, patch) {
+        if (!patch || patch.texture < MIN_TEXTURE) return null;
+        let best = Infinity;
+        let bx = 0;
+        let by = 0;
+        const scores = [];
+        for (let dy = -RADIUS; dy <= RADIUS; dy += STEP) {
+          for (let dx = -RADIUS; dx <= RADIUS; dx += STEP) {
+            const s = sadAt(bytes, fw, fh, patch, patch.cx + dx, patch.cy + dy, best * 3);
+            scores.push(s);
+            if (s < best) {
+              best = s;
+              bx = dx;
+              by = dy;
+            }
+          }
+        }
+        if (!Number.isFinite(best)) return null;
+        for (const [ex, ey] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+          const s = sadAt(bytes, fw, fh, patch, patch.cx + bx + ex, patch.cy + by + ey, best);
+          if (s < best) {
+            best = s;
+            bx += ex;
+            by += ey;
+          }
+        }
+        const finite = scores.filter(Number.isFinite).sort((a, b) => a - b);
+        const median = finite[finite.length >> 1] || best;
+        const quality = median > 0 ? Math.max(0, Math.min(1, 1 - best / median)) : 0;
+        return { dx: bx, dy: by, quality };
+      }
+      module.exports = { grabPatch: grabPatch2, matchPatch: matchPatch2, STEP, HALF, RADIUS, MIN_TEXTURE };
+    }
+  });
+
   // src/main.js
   var core = require_tryon_core();
   var render = require_tryon_render();
   var { SAMPLES } = require_beads();
   var { createPointsFilter } = require_one_euro();
   var { hand3d } = require_hand3d();
-  var HOLD_MS = 1200;
+  var HOLD_MS = 700;
+  var TRACK_MS = 3e3;
   var FADE_MS = 400;
+  var PITCH_MAX = 0.3;
+  var PITCH_DEAD = 0.06;
+  var { grabPatch, matchPatch } = require_skin_track();
   var FOLLOW = 0.4;
   var PITCH_GAIN = 0.5;
   var $ = (id) => document.getElementById(id);
@@ -767,7 +857,7 @@
       async load() {
         if (!window.Hands) await withTimeout(loadScript(base + "hands.js"), 2e4, "\u65B9\u6848A\u811A\u672C");
         hands = new window.Hands({ locateFile: (f) => base + f });
-        hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+        hands.setOptions({ maxNumHands: 1, modelComplexity: 0, minDetectionConfidence: 0.6, minTrackingConfidence: 0.4 });
         hands.onResults((r) => {
           if (pending) pending(r);
         });
@@ -822,6 +912,8 @@
           }
           if (u === MODEL_TGZ) buf = await untarModel(buf);
           ctrls.forEach((c, j) => j !== i && c.abort());
+          if (fetchModel.won) return buf;
+          fetchModel.won = true;
           log("\u624B\u90E8\u6A21\u578B\u6765\u81EA " + ["\u56FD\u5185\u955C\u50CF", "GitHub", "jsDelivr", "jsDelivr-CF"][i] + " " + ((performance.now() - T0) / 1e3).toFixed(1) + "s");
           return buf;
         })
@@ -873,7 +965,10 @@
           vision.HandLandmarker.createFromOptions(fileset, {
             baseOptions: { modelAssetBuffer: model, delegate },
             runningMode: "VIDEO",
-            numHands: 1
+            numHands: 1,
+            minHandDetectionConfidence: 0.6,
+            minHandPresenceConfidence: 0.4,
+            minTrackingConfidence: 0.4
           }),
           6e4,
           "\u65B9\u6848B\u6A21\u578B\u542F\u52A8"
@@ -925,14 +1020,14 @@
     return false;
   }
   var params = new URLSearchParams(location.search);
-  var WANT = params.get("engine") === "A" ? "A" : "B";
+  var WANT = params.get("engine") === "B" ? "B" : "A";
   var ORDER_ALL = WANT === "A" ? [() => legacyEngine(LEGACY_BASES[0]), () => legacyEngine(LEGACY_BASES[1])] : [() => tasksEngine("CPU")];
   function reloadWith(engineName, reason) {
     const tried = (params.get("tried") || "").split(",").filter(Boolean);
     if (tried.indexOf(engineName) >= 0) return false;
     tried.push(WANT);
     log("\u6362\u65B9\u6848" + engineName + "\uFF1A" + reason);
-    const q = new URLSearchParams({ engine: engineName, auto: "1", tried: tried.join(","), why: "\u65B9\u6848" + WANT + " " + reason, v: "8" });
+    const q = new URLSearchParams({ engine: engineName, auto: "1", tried: tried.join(","), why: "\u65B9\u6848" + WANT + " " + reason, v: "9" });
     setTimeout(() => location.replace(location.pathname + "?" + q.toString()), 800);
     return true;
   }
@@ -961,6 +1056,61 @@
     if (state.handLog.length > 60) state.handLog.shift();
     return hand.label;
   }
+  function plausibleHand(lm) {
+    const d = (a, b) => Math.hypot(lm[a].x - lm[b].x, lm[a].y - lm[b].y);
+    const palm = d(0, 9);
+    const knuckles = d(5, 17);
+    if (!(palm > 0.03)) return false;
+    const r = knuckles / palm;
+    return r > 0.15 && r < 1.6;
+  }
+  var trackCanvas = document.createElement("canvas");
+  var trackCtx = trackCanvas.getContext("2d", { willReadFrequently: true });
+  function trackFrame() {
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    const s = 240 / Math.max(vw, vh);
+    const w = Math.round(vw * s);
+    const h = Math.round(vh * s);
+    if (trackCanvas.width !== w || trackCanvas.height !== h) {
+      trackCanvas.width = w;
+      trackCanvas.height = h;
+    }
+    trackCtx.drawImage(video, 0, 0, w, h);
+    return { bytes: trackCtx.getImageData(0, 0, w, h).data, w, h };
+  }
+  function followSkin(now) {
+    if (!state.trackPoint) return false;
+    const f = trackFrame();
+    const cx = state.trackPoint.x * f.w;
+    const cy = state.trackPoint.y * f.h;
+    if (!state.patch) {
+      state.patch = grabPatch(f.bytes, f.w, f.h, cx, cy);
+      state.trackingSkin = !!state.patch;
+      state.skinOkAt = now;
+      return !!state.patch;
+    }
+    const m = matchPatch(f.bytes, f.w, f.h, state.patch);
+    if (!m || m.quality < 0.2) {
+      state.skinBad = (state.skinBad || 0) + 1;
+      if (state.skinBad > 3) {
+        state.patch = null;
+        state.trackPoint = null;
+        return false;
+      }
+      return true;
+    }
+    state.skinBad = 0;
+    const dx = m.dx / f.w;
+    const dy = m.dy / f.h;
+    const move = (p) => ({ x: p.x + dx, y: p.y + dy });
+    state.last = state.last.map(move);
+    if (state.shown) state.shown = state.shown.map(move);
+    state.trackPoint = move(state.trackPoint);
+    state.patch = grabPatch(f.bytes, f.w, f.h, state.trackPoint.x * f.w, state.trackPoint.y * f.h);
+    state.skinOkAt = now;
+    return !!state.patch;
+  }
   function onResults(res) {
     state.detects += 1;
     if (!state.firstResult) {
@@ -968,7 +1118,22 @@
       log("\u7B2C\u4E00\u6B21\u8BC6\u522B\u5B8C\u6210");
     }
     const lm = res.multiHandLandmarks && res.multiHandLandmarks[0];
-    if (!lm) return;
+    if (!lm) {
+      state.acq = 0;
+      return;
+    }
+    const hd0 = res.multiHandedness && res.multiHandedness[0];
+    if (!state.last || state.trackingSkin) {
+      const score = hd0 && hd0.score != null ? hd0.score : 1;
+      if (score < 0.75 || !plausibleHand(lm)) {
+        state.acq = 0;
+        return;
+      }
+      state.acq = (state.acq || 0) + 1;
+      if (state.acq < 2 && !state.trackingSkin) return;
+    }
+    state.trackingSkin = false;
+    state.patch = null;
     state.hits += 1;
     const now = performance.now();
     const pts = filter.filter(lm.map((p) => ({ x: p.x, y: p.y })), now / 1e3);
@@ -985,9 +1150,13 @@
         if (state.roll > Math.PI) state.roll -= 2 * Math.PI;
         if (state.roll < -Math.PI) state.roll += 2 * Math.PI;
       }
-      state.pitch = state.pitch * 0.6 + h.pitch * PITCH_GAIN * 0.4;
-      state.cosPitch = Math.sqrt(1 - Math.min(0.8, Math.abs(h.pitch)) ** 2 * PITCH_GAIN);
+      let pt = h.pitch * PITCH_GAIN;
+      pt = Math.abs(pt) < PITCH_DEAD ? 0 : pt - Math.sign(pt) * PITCH_DEAD;
+      pt = Math.max(-PITCH_MAX, Math.min(PITCH_MAX, pt));
+      state.pitch = state.pitch * 0.7 + pt * 0.3;
+      state.cosPitch = Math.sqrt(1 - Math.min(0.8, Math.abs(h.pitch)) ** 2);
       state.spinDir = h.spinDir;
+      state.dbg = { pitchRaw: +h.pitch.toFixed(2), roll: Math.round(h.roll * 180 / Math.PI), hand: hand.label };
     }
     state.last = pts;
     state.lastSeen = now;
@@ -1011,19 +1180,33 @@
     canvas.style.top = (box.height - vh * s) / 2 + "px";
     canvas.style.transform = state.facing === "user" ? "scaleX(-1)" : "none";
   }
+  var KNUCKLE_TO_WRIST = 1.3;
+  var PALM_TO_WRIST = 0.9;
+  function wristScale(pose, W, H) {
+    const P = state.shown;
+    const kn = Math.hypot((P[5].x - P[17].x) * W, (P[5].y - P[17].y) * H);
+    const palm = pose.palmPx / Math.max(0.6, state.cosPitch || 1);
+    const wristPx = Math.max(KNUCKLE_TO_WRIST * kn, PALM_TO_WRIST * palm);
+    const target = wristPx / (2 * core.BODY.wristSemiBreadth(pose.wristMm));
+    state.scale = state.scale ? state.scale * 0.7 + target * 0.3 : target;
+    return state.scale;
+  }
   function drawFrame() {
     const W = canvas.width;
     const H = canvas.height;
     ctx.drawImage(video, 0, 0, W, H);
     const now = performance.now();
-    const age = now - state.lastSeen;
+    let age = now - state.lastSeen;
     state.frames += 1;
+    if (state.last && age > 150 && age < TRACK_MS) {
+      if (followSkin(now) && now - state.skinOkAt < 300) age = Math.min(age, HOLD_MS - 1);
+    }
     if (state.last && age < HOLD_MS + FADE_MS) {
       if (!state.shown) state.shown = state.last.map((p) => ({ x: p.x, y: p.y }));
       state.shown = state.shown.map((p, i) => ({ x: p.x + (state.last[i].x - p.x) * FOLLOW, y: p.y + (state.last[i].y - p.y) * FOLLOW }));
       let pose = core.estimateWristPose(state.shown, W, H, state.wristCm * 10);
       if (pose) {
-        pose = Object.assign({}, pose, { pxPerMm: pose.pxPerMm / Math.max(0.6, state.cosPitch || 1) });
+        pose = Object.assign({}, pose, { pxPerMm: wristScale(pose, W, H) });
         const list = beads();
         let rotate = 0;
         if (state.roll != null && state.spinDir) {
@@ -1034,12 +1217,19 @@
         const layout = core.computeLayout({ pose, beads: list, pitch3d: state.pitch, adjust: { rotate } });
         ctx.globalAlpha = age < HOLD_MS ? 1 : Math.max(0, 1 - (age - HOLD_MS) / FADE_MS);
         render.drawTryon(ctx, layout, state.images, { width: W, height: H, shadow: true });
+        state.drawn = now;
+        state.dbgPose = { palmPx: Math.round(pose.palmPx), pxPerMm: +pose.pxPerMm.toFixed(2), halfW: Math.round(layout.band.halfWidth), pitch: +state.pitch.toFixed(2), poseRoll: Math.round(pose.roll * 180 / Math.PI) };
+        if (now - state.lastSeen < 150) state.trackPoint = { x: layout.band.cx / W, y: layout.band.cy / H };
         ctx.globalAlpha = 1;
         if (state.debug) render.drawDebug(ctx, state.last, W, H, layout);
       }
     } else {
       state.shown = null;
       state.roll = null;
+      state.scale = 0;
+      state.patch = null;
+      state.trackPoint = null;
+      state.trackingSkin = false;
       hand.label = null;
       hand.other = 0;
       if (state.last) filter.reset();
@@ -1258,7 +1448,7 @@
     updateLabels();
   };
   $("modelBtn").onclick = () => {
-    const q = new URLSearchParams({ engine: state.engineName === "A" ? "B" : "A", auto: "1", v: "8" });
+    const q = new URLSearchParams({ engine: state.engineName === "A" ? "B" : "A", auto: "1", v: "9" });
     location.replace(location.pathname + "?" + q.toString());
   };
   $("wristMinus").onclick = () => {
