@@ -840,7 +840,6 @@
   }
   async function loop() {
     if (!state.running) return;
-    if (video.srcObject) checkStuck(performance.now());
     if (video.readyState >= 2) {
       layoutCanvas();
       drawFrame();
@@ -855,62 +854,87 @@
           state.busy = false;
         });
       }
+    } else if (performance.now() - state.since > 1e3) {
+      $("fps").textContent = "\u7B49\u5F85\u753B\u9762 \xB7 \u72B6\u6001 " + video.readyState;
+      state.since = performance.now();
     }
     requestAnimationFrame(loop);
   }
   var wait = (ms) => new Promise((r) => setTimeout(r, ms));
-  async function openStream(plain) {
-    const video0 = plain ? { facingMode: state.facing } : { facingMode: state.facing, width: { ideal: 640 }, height: { ideal: 480 } };
-    return navigator.mediaDevices.getUserMedia({ audio: false, video: video0 });
+  var logs = [];
+  function log(msg) {
+    const t = ((performance.now() - T0) / 1e3).toFixed(1);
+    logs.push(t + "s " + msg);
+    if (logs.length > 12) logs.shift();
+    const el = $("log");
+    if (el) el.textContent = logs.join("\n");
   }
-  async function startCamera(plain) {
+  var T0 = performance.now();
+  function stopStream() {
+    const old = video.srcObject;
+    if (!old) return false;
+    old.getTracks().forEach((t) => t.stop());
+    video.srcObject = null;
+    return true;
+  }
+  async function startCamera() {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setStatus("\u8FD9\u4E2A\u6D4F\u89C8\u5668\u4E0D\u80FD\u6253\u5F00\u6444\u50CF\u5934\u3002\u8BF7\u70B9\u53F3\u4E0A\u89D2\u300C\u2026\u300D\uFF0C\u9009\u300C\u5728\u6D4F\u89C8\u5668\u6253\u5F00\u300D\u518D\u8BD5", true);
       return;
     }
     const token = state.camToken = (state.camToken || 0) + 1;
-    try {
-      if (video.srcObject) {
-        video.srcObject.getTracks().forEach((t) => t.stop());
-        video.srcObject = null;
-        await wait(300);
+    $("camBtn").disabled = true;
+    const facing = state.facing;
+    const tries = [
+      { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 } },
+      { facingMode: facing },
+      { facingMode: facing }
+    ];
+    if (stopStream()) await wait(800);
+    let lastErr = null;
+    for (let i = 0; i < tries.length; i++) {
+      if (token !== state.camToken) return;
+      try {
+        log("\u6253\u5F00" + (facing === "user" ? "\u524D\u7F6E" : "\u540E\u7F6E") + " \u7B2C" + (i + 1) + "\u6B21");
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: tries[i] });
+        if (token !== state.camToken) return stream.getTracks().forEach((t) => t.stop());
+        const track = stream.getVideoTracks()[0];
+        const set = track && track.getSettings ? track.getSettings() : {};
+        log("\u6210\u529F " + (track ? track.label : "") + " " + (set.width || "?") + "\xD7" + (set.height || "?"));
+        track.onended = () => log("\u6444\u50CF\u5934\u88AB\u5173\u95ED");
+        track.onmute = () => log("\u6444\u50CF\u5934\u6682\u505C\u51FA\u753B\u9762");
+        track.onunmute = () => log("\u6444\u50CF\u5934\u6062\u590D");
+        video.srcObject = stream;
+        try {
+          await video.play();
+        } catch (e) {
+          log("\u64AD\u653E\u5931\u8D25 " + e.name);
+        }
+        state.camLabel = facing === "user" ? "\u524D\u7F6E" : "\u540E\u7F6E";
+        if (!state.running) {
+          state.running = true;
+          setStatus("\u6B63\u5728\u52A0\u8F7D\u8BC6\u522B\u6A21\u578B\uFF08\u9996\u6B21\u7EA6 10MB\uFF09\u2026");
+          requestAnimationFrame(loop);
+        } else setStatus("");
+        $("start").style.display = "none";
+        $("camBtn").disabled = false;
+        updateLabels();
+        return;
+      } catch (e) {
+        lastErr = e;
+        log("\u5931\u8D25 " + (e.name || "") + " " + (e.message || ""));
+        await wait(700);
       }
-      const stream = await openStream(plain);
-      if (token !== state.camToken) return stream.getTracks().forEach((t) => t.stop());
-      video.srcObject = stream;
-      await video.play();
-      state.camLabel = (state.facing === "user" ? "\u524D\u7F6E" : "\u540E\u7F6E") + (plain ? "\xB7\u9ED8\u8BA4" : "");
-      state.lastVideoTime = -1;
-      state.videoStuckSince = performance.now();
-      state.plain = !!plain;
-      if (!state.running) {
-        state.running = true;
-        setStatus("\u6B63\u5728\u52A0\u8F7D\u8BC6\u522B\u6A21\u578B\uFF08\u9996\u6B21\u7EA6 10MB\uFF09\u2026");
-        requestAnimationFrame(loop);
-      }
-      $("start").style.display = "none";
-      updateLabels();
-    } catch (e) {
-      if (!plain) return startCamera(true);
-      setStatus("\u6444\u50CF\u5934\u6253\u4E0D\u5F00\uFF1A" + (e.name || "") + " " + (e.message || "") + "\u3002\u8BF7\u5141\u8BB8\u4F7F\u7528\u6444\u50CF\u5934\uFF0C\u6216\u6362\u6D4F\u89C8\u5668\u6253\u5F00", true);
     }
-  }
-  function checkStuck(now) {
-    if (video.currentTime !== state.lastVideoTime) {
-      state.lastVideoTime = video.currentTime;
-      state.videoStuckSince = now;
-      return;
-    }
-    if (now - state.videoStuckSince < 2500) return;
-    state.videoStuckSince = now + 1e9;
-    if (!state.plain) startCamera(true);
-    else setStatus("\u6444\u50CF\u5934\u6CA1\u6709\u753B\u9762\u3002\u8BF7\u70B9\u300C\u5207\u6362\u6444\u50CF\u5934\u300D\uFF0C\u6216\u70B9\u53F3\u4E0A\u89D2\u300C\u2026\u300D\u9009\u300C\u5728\u6D4F\u89C8\u5668\u6253\u5F00\u300D", true);
+    $("camBtn").disabled = false;
+    $("log").style.display = "block";
+    setStatus("\u6444\u50CF\u5934\u6253\u4E0D\u5F00\uFF1A" + (lastErr && lastErr.name) + "\u3002\u53EF\u4EE5\u518D\u70B9\u4E00\u6B21\u300C" + $("camBtn").textContent + "\u300D\uFF0C\u6216\u70B9\u53F3\u4E0A\u89D2\u300C\u2026\u300D\u9009\u300C\u5728\u6D4F\u89C8\u5668\u6253\u5F00\u300D", true);
   }
   $("start").onclick = async () => {
     setStatus("\u51C6\u5907\u4E2D\u2026");
     await loadBeadImages();
     createHands();
-    startCamera(false);
+    startCamera();
   };
   $("nextBtn").onclick = () => {
     state.sample = (state.sample + 1) % SAMPLES.length;
@@ -920,7 +944,7 @@
     state.facing = state.facing === "user" ? "environment" : "user";
     state.last = null;
     filter.reset();
-    startCamera(false);
+    startCamera();
   };
   $("fitBtn").onclick = () => {
     state.fit = state.fit === "cover" ? "contain" : "cover";
@@ -929,6 +953,7 @@
   };
   $("debugBtn").onclick = () => {
     state.debug = !state.debug;
+    $("log").style.display = state.debug ? "block" : "none";
     updateLabels();
   };
   $("modelBtn").onclick = () => {
