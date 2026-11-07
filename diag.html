@@ -119,7 +119,7 @@
     var cams = [];
     try { cams = (await navigator.mediaDevices.enumerateDevices()).filter(function (d) { return d.kind === 'videoinput'; }); } catch (e) { out('列摄像头失败 ' + e.name); }
     out('摄像头数量: ' + cams.length + ' → ' + cams.map(function (d, i) { return i + ':' + (d.label || '(无名)'); }).join(' ; '));
-    for (var j = 0; j < cams.length && j < 6; j++) {
+    for (var j = 0; j < cams.length; j++) {
       if (!cams[j].deviceId) continue;
       await tryOne('F' + j + ' ' + (cams[j].label || '摄像头' + j), { deviceId: { exact: cams[j].deviceId } });
     }

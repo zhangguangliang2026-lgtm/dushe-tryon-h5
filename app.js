@@ -685,6 +685,11 @@
     since: performance.now(),
     detectMs: 0,
     handLog: [],
+    backIndex: 0,
+    backCams: [],
+    frontCams: [],
+    modelReady: false,
+    switching: false,
     fit: "contain",
     // contain 显示完整画面 / cover 铺满屏幕
     camLabel: ""
@@ -722,6 +727,8 @@
     $("debugBtn").textContent = state.debug ? "\u5173\u8C03\u8BD5" : "\u8C03\u8BD5\u70B9";
     $("fitBtn").textContent = state.fit === "cover" ? "\u753B\u9762\uFF1A\u94FA\u6EE1" : "\u753B\u9762\uFF1A\u5B8C\u6574";
     $("camBtn").textContent = state.facing === "user" ? "\u6362\u540E\u7F6E" : "\u6362\u524D\u7F6E";
+    const n = (state.backCams || []).length;
+    $("lensBtn").textContent = n > 1 && state.facing !== "user" ? "\u955C\u5934 " + (state.backIndex + 1) + "/" + n : "\u6362\u955C\u5934";
   }
   var hands = null;
   function createHands() {
@@ -746,6 +753,10 @@
   }
   function onResults(res) {
     state.detects += 1;
+    if (!state.firstResult) {
+      state.firstResult = true;
+      log("\u7B2C\u4E00\u6B21\u8BC6\u522B\u5B8C\u6210");
+    }
     const lm = res.multiHandLandmarks && res.multiHandLandmarks[0];
     if (!lm) return;
     state.hits += 1;
@@ -843,13 +854,16 @@
     if (video.readyState >= 2) {
       layoutCanvas();
       drawFrame();
-      if (!state.busy) {
+      if (!state.busy && state.modelReady && !state.switching) {
         state.busy = true;
         const t0 = performance.now();
-        const guard = setTimeout(() => state.busy = false, 3e3);
+        const guard = setTimeout(() => log("\u8BC6\u522B\u8D85\u8FC7 5 \u79D2\u6CA1\u8FD4\u56DE"), 5e3);
         hands.send({ image: video }).then(() => {
           state.detectMs = state.detectMs * 0.8 + (performance.now() - t0) * 0.2;
-        }).catch((e) => setStatus("\u8BC6\u522B\u51FA\u9519\uFF1A" + e.message, true)).finally(() => {
+        }).catch((e) => {
+          log("\u8BC6\u522B\u51FA\u9519 " + e.message);
+          setStatus("\u8BC6\u522B\u51FA\u9519\uFF1A" + e.message, true);
+        }).finally(() => {
           clearTimeout(guard);
           state.busy = false;
         });
@@ -865,7 +879,7 @@
   function log(msg) {
     const t = ((performance.now() - T0) / 1e3).toFixed(1);
     logs.push(t + "s " + msg);
-    if (logs.length > 12) logs.shift();
+    if (logs.length > 20) logs.shift();
     const el = $("log");
     if (el) el.textContent = logs.join("\n");
   }
@@ -877,30 +891,61 @@
     video.srcObject = null;
     return true;
   }
+  function camNo(d) {
+    const m = /camera\s*(\d+)/i.exec(d.label || "");
+    return m ? +m[1] : 99;
+  }
+  var isFront = (d) => /front|user|前/i.test(d.label || "");
+  async function refreshCams() {
+    try {
+      const all = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput" && d.deviceId);
+      if (!all.some((d) => d.label)) return;
+      state.backCams = all.filter((d) => !isFront(d)).sort((x, y) => camNo(x) - camNo(y));
+      state.frontCams = all.filter(isFront).sort((x, y) => camNo(x) - camNo(y));
+    } catch (e) {
+      log("\u5217\u6444\u50CF\u5934\u5931\u8D25 " + e.name);
+    }
+  }
+  function pickCam() {
+    const list = state.facing === "user" ? state.frontCams : state.backCams;
+    if (!list || !list.length) return null;
+    const i = state.facing === "user" ? 0 : Math.min(state.backIndex, list.length - 1);
+    return list[i];
+  }
+  async function waitIdle() {
+    state.switching = true;
+    for (let i = 0; i < 50 && state.busy; i++) await wait(100);
+  }
+  async function openOnce(constraints, token) {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: constraints });
+    if (token !== state.camToken) {
+      stream.getTracks().forEach((t) => t.stop());
+      return null;
+    }
+    return stream;
+  }
   async function startCamera() {
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setStatus("\u8FD9\u4E2A\u6D4F\u89C8\u5668\u4E0D\u80FD\u6253\u5F00\u6444\u50CF\u5934\u3002\u8BF7\u70B9\u53F3\u4E0A\u89D2\u300C\u2026\u300D\uFF0C\u9009\u300C\u5728\u6D4F\u89C8\u5668\u6253\u5F00\u300D\u518D\u8BD5", true);
       return;
     }
     const token = state.camToken = (state.camToken || 0) + 1;
-    $("camBtn").disabled = true;
-    const facing = state.facing;
-    const tries = [
-      { facingMode: facing, width: { ideal: 640 }, height: { ideal: 480 } },
-      { facingMode: facing },
-      { facingMode: facing }
-    ];
-    if (stopStream()) await wait(800);
+    setButtons(false);
+    await waitIdle();
+    if (stopStream()) await wait(1e3);
+    await refreshCams();
     let lastErr = null;
-    for (let i = 0; i < tries.length; i++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       if (token !== state.camToken) return;
+      const cam = pickCam();
+      const constraints = cam ? { deviceId: { exact: cam.deviceId } } : { facingMode: state.facing };
       try {
-        log("\u6253\u5F00" + (facing === "user" ? "\u524D\u7F6E" : "\u540E\u7F6E") + " \u7B2C" + (i + 1) + "\u6B21");
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: tries[i] });
-        if (token !== state.camToken) return stream.getTracks().forEach((t) => t.stop());
+        log("\u6253\u5F00 " + (cam ? cam.label : state.facing === "user" ? "\u524D\u7F6E(\u9ED8\u8BA4)" : "\u540E\u7F6E(\u9ED8\u8BA4)") + (attempt ? " \u91CD\u8BD5" + attempt : ""));
+        const stream = await openOnce(constraints, token);
+        if (!stream) return;
         const track = stream.getVideoTracks()[0];
-        const set = track && track.getSettings ? track.getSettings() : {};
-        log("\u6210\u529F " + (track ? track.label : "") + " " + (set.width || "?") + "\xD7" + (set.height || "?"));
+        const set = track.getSettings ? track.getSettings() : {};
+        log("\u6210\u529F " + track.label + " " + (set.width || "?") + "\xD7" + (set.height || "?"));
         track.onended = () => log("\u6444\u50CF\u5934\u88AB\u5173\u95ED");
         track.onmute = () => log("\u6444\u50CF\u5934\u6682\u505C\u51FA\u753B\u9762");
         track.onunmute = () => log("\u6444\u50CF\u5934\u6062\u590D");
@@ -910,30 +955,75 @@
         } catch (e) {
           log("\u64AD\u653E\u5931\u8D25 " + e.name);
         }
-        state.camLabel = facing === "user" ? "\u524D\u7F6E" : "\u540E\u7F6E";
+        state.camLabel = track.label || (state.facing === "user" ? "\u524D\u7F6E" : "\u540E\u7F6E");
+        if (!cam && state.facing !== "user") {
+          await refreshCams();
+          const best = pickCam();
+          if (best && best.label !== track.label) {
+            log("\u6362\u6210\u4E3B\u6444 " + best.label);
+            state.switching = false;
+            setButtons(true);
+            return startCamera();
+          }
+        }
+        state.switching = false;
+        setButtons(true);
+        $("start").style.display = "none";
+        setStatus(state.modelReady ? "" : "\u6B63\u5728\u52A0\u8F7D\u8BC6\u522B\u6A21\u578B\u2026");
         if (!state.running) {
           state.running = true;
-          setStatus("\u6B63\u5728\u52A0\u8F7D\u8BC6\u522B\u6A21\u578B\uFF08\u9996\u6B21\u7EA6 10MB\uFF09\u2026");
           requestAnimationFrame(loop);
-        } else setStatus("");
-        $("start").style.display = "none";
-        $("camBtn").disabled = false;
+        }
         updateLabels();
         return;
       } catch (e) {
         lastErr = e;
         log("\u5931\u8D25 " + (e.name || "") + " " + (e.message || ""));
-        await wait(700);
+        await wait(1e3);
       }
     }
-    $("camBtn").disabled = false;
+    state.switching = false;
+    setButtons(true);
     $("log").style.display = "block";
-    setStatus("\u6444\u50CF\u5934\u6253\u4E0D\u5F00\uFF1A" + (lastErr && lastErr.name) + "\u3002\u53EF\u4EE5\u518D\u70B9\u4E00\u6B21\u300C" + $("camBtn").textContent + "\u300D\uFF0C\u6216\u70B9\u53F3\u4E0A\u89D2\u300C\u2026\u300D\u9009\u300C\u5728\u6D4F\u89C8\u5668\u6253\u5F00\u300D", true);
+    setStatus("\u6444\u50CF\u5934\u6253\u4E0D\u5F00\uFF1A" + (lastErr && lastErr.name) + "\u3002\u53EF\u4EE5\u518D\u70B9\u4E00\u6B21\u5207\u6362\uFF0C\u6216\u70B9\u53F3\u4E0A\u89D2\u300C\u2026\u300D\u9009\u300C\u5728\u6D4F\u89C8\u5668\u6253\u5F00\u300D", true);
+  }
+  function setButtons(on) {
+    ["camBtn", "lensBtn"].forEach((id) => $(id).disabled = !on);
+  }
+  async function loadModel() {
+    const t0 = performance.now();
+    log("\u5F00\u59CB\u52A0\u8F7D\u8BC6\u522B\u6A21\u578B");
+    createHands();
+    try {
+      await hands.initialize();
+      state.modelReady = true;
+      log("\u6A21\u578B\u52A0\u8F7D\u5B8C\u6210 " + ((performance.now() - t0) / 1e3).toFixed(1) + "s");
+    } catch (e) {
+      log("\u6A21\u578B\u52A0\u8F7D\u5931\u8D25 " + (e && e.message));
+      setStatus("\u8BC6\u522B\u6A21\u578B\u52A0\u8F7D\u5931\u8D25\uFF1A" + (e && e.message) + "\u3002\u8BF7\u68C0\u67E5\u7F51\u7EDC\u540E\u5237\u65B0", true);
+    }
   }
   $("start").onclick = async () => {
-    setStatus("\u51C6\u5907\u4E2D\u2026");
+    $("start").disabled = true;
+    $("log").style.display = "block";
+    setStatus("\u6B63\u5728\u52A0\u8F7D\u8BC6\u522B\u6A21\u578B\uFF08\u9996\u6B21\u7EA6 8MB\uFF0C\u7F51\u7EDC\u6162\u65F6\u8981\u7B49\u4E00\u4F1A\uFF09\u2026");
     await loadBeadImages();
-    createHands();
+    await loadModel();
+    if (!state.modelReady) {
+      $("start").disabled = false;
+      return;
+    }
+    setStatus("\u6B63\u5728\u6253\u5F00\u6444\u50CF\u5934\u2026");
+    await startCamera();
+    setTimeout(() => {
+      if (!state.debug) $("log").style.display = "none";
+    }, 8e3);
+  };
+  $("lensBtn").onclick = () => {
+    if (state.facing === "user") state.facing = "environment";
+    else state.backIndex = (state.backIndex + 1) % Math.max(1, (state.backCams || []).length);
+    state.last = null;
+    filter.reset();
     startCamera();
   };
   $("nextBtn").onclick = () => {
